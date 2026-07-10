@@ -119,6 +119,88 @@ function ResizeHandle({ onResize }: { onResize: (dx: number) => void }): React.J
 
 const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v))
 
+// ---------------------------------------------------------------------------
+// Responsive three-pane layout. The file tree and preview are fixed-width side
+// panels; the chat column is the flexible middle. Naively they'd squeeze the
+// chat to nothing on a narrow window. Instead we measure the container and,
+// as it shrinks, first pull the panels down toward their minimums (keeping a
+// usable chat column), then float them over the chat as overlay drawers.
+// ---------------------------------------------------------------------------
+
+const MIN_CHAT = 380 // chat never gets narrower than this while panels are inline
+const TREE_MIN = 160
+const TREE_MAX = 560
+const PREVIEW_MIN = 300
+const HANDLE_W = 4 // ResizeHandle width (w-1) + slack
+
+type PanelMode = 'inline' | 'overlay' | 'hidden'
+type PanelLayout = { mode: PanelMode; width: number }
+
+function computeLayout(
+  cw: number,
+  showTree: boolean,
+  showPreview: boolean,
+  treeW: number,
+  previewW: number,
+): { tree: PanelLayout; preview: PanelLayout } {
+  const tree: PanelLayout = { mode: showTree ? 'inline' : 'hidden', width: treeW }
+  const preview: PanelLayout = { mode: showPreview ? 'inline' : 'hidden', width: previewW }
+  const wantTree = showTree ? treeW : 0
+  const wantPrev = showPreview ? previewW : 0
+  const handles = (showTree ? HANDLE_W : 0) + (showPreview ? HANDLE_W : 0)
+
+  // Roomy: both fit inline at their chosen widths with a comfortable chat.
+  if (cw - wantTree - wantPrev - handles >= MIN_CHAT) return { tree, preview }
+
+  // Tight: keep them inline but shrink toward their minimums, splitting the
+  // available budget in proportion to how much each wanted above its minimum.
+  const budget = cw - MIN_CHAT - handles
+  const minSum = (showTree ? TREE_MIN : 0) + (showPreview ? PREVIEW_MIN : 0)
+  if (budget >= minSum) {
+    const extra = budget - minSum
+    const treeExtra = showTree ? treeW - TREE_MIN : 0
+    const prevExtra = showPreview ? previewW - PREVIEW_MIN : 0
+    const extraSum = treeExtra + prevExtra
+    // Distribute the leftover budget in proportion to what each panel wanted
+    // above its minimum; if both are already at their minimums, split evenly.
+    const openPanels = (showTree ? 1 : 0) + (showPreview ? 1 : 0)
+    const share = (own: number): number =>
+      extraSum > 0 ? (extra * own) / extraSum : extra / openPanels
+    if (showTree) tree.width = Math.round(TREE_MIN + share(treeExtra))
+    if (showPreview) preview.width = Math.round(PREVIEW_MIN + share(prevExtra))
+    return { tree, preview }
+  }
+
+  // Cramped: not enough room for both panels + a usable chat even at minimums.
+  // Float the open panels over the chat, which now spans the full width.
+  if (showTree) {
+    tree.mode = 'overlay'
+    tree.width = Math.min(treeW, cw - 48)
+  }
+  if (showPreview) {
+    preview.mode = 'overlay'
+    preview.width = Math.min(previewW, cw - 48)
+  }
+  return { tree, preview }
+}
+
+/** Track an element's live pixel width via ResizeObserver. */
+function useElementWidth<T extends HTMLElement>(): [React.RefObject<T | null>, number] {
+  const ref = useRef<T>(null)
+  const [w, setW] = useState(0)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) setW(e.contentRect.width)
+    })
+    ro.observe(el)
+    setW(el.getBoundingClientRect().width)
+    return () => ro.disconnect()
+  }, [])
+  return [ref, w]
+}
+
 const readAs = (file: File, how: 'dataURL' | 'text'): Promise<string> =>
   new Promise((resolve, reject) => {
     const r = new FileReader()
@@ -201,6 +283,13 @@ export default function Workspace({
     setTreeReload((prev) => ({ dirs, nonce: (prev?.nonce ?? 0) + 1 }))
   }, [])
   const [viewer, setViewer] = useState<Preview | null>(null)
+  const [mainRef, mainW] = useElementWidth<HTMLDivElement>()
+  // Default to a wide value until measured so the first paint is inline (the
+  // common case) rather than flashing the overlay drawers.
+  const layout = useMemo(
+    () => computeLayout(mainW || 99999, showFiles, !!viewer, treeWidth, previewWidth),
+    [mainW, showFiles, viewer, treeWidth, previewWidth],
+  )
   const [items, setItems] = useState<Item[]>([])
   const [input, setInput] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -965,11 +1054,11 @@ export default function Workspace({
         />
       )}
 
-      <div className="flex min-h-0 flex-1">
-        {showFiles && (
+      <div ref={mainRef} className="relative flex min-h-0 flex-1">
+        {layout.tree.mode === 'inline' && (
           <>
             <aside
-              style={{ width: treeWidth }}
+              style={{ width: layout.tree.width }}
               className="shrink-0 overflow-hidden border-r border-zinc-800"
             >
               <FileTree
@@ -980,7 +1069,7 @@ export default function Workspace({
               />
             </aside>
             <ResizeHandle
-              onResize={(dx) => setTreeWidth((w) => clamp(w + dx, 160, 560))}
+              onResize={(dx) => setTreeWidth((w) => clamp(w + dx, TREE_MIN, TREE_MAX))}
             />
           </>
         )}
@@ -1123,15 +1212,15 @@ export default function Workspace({
           </footer>
         </div>
 
-        {viewer && (
+        {viewer && layout.preview.mode === 'inline' && (
           <>
             <ResizeHandle
               // Handle sits left of the preview: dragging left widens it.
               onResize={(dx) =>
-                setPreviewWidth((w) => clamp(w - dx, 320, window.innerWidth - 360))
+                setPreviewWidth((w) => clamp(w - dx, PREVIEW_MIN, window.innerWidth - 360))
               }
             />
-            <div style={{ width: previewWidth }} className="flex shrink-0">
+            <div style={{ width: layout.preview.width }} className="flex shrink-0">
               <FilePreview
                 preview={viewer}
                 workspaceRoot={cwd}
@@ -1140,6 +1229,45 @@ export default function Workspace({
               />
             </div>
           </>
+        )}
+
+        {/* Overlay drawers: on a window too narrow for inline panels, the open
+            panels float over the chat with a scrim. Clicking the scrim (or a
+            panel's own close) dismisses them; the chat stays full-width. */}
+        {(layout.tree.mode === 'overlay' || layout.preview.mode === 'overlay') && (
+          <div
+            className="absolute inset-0 z-20 bg-black/50"
+            onClick={() => {
+              if (layout.tree.mode === 'overlay') setShowFiles(false)
+              if (layout.preview.mode === 'overlay') setViewer(null)
+            }}
+          />
+        )}
+        {layout.tree.mode === 'overlay' && (
+          <aside
+            style={{ width: layout.tree.width }}
+            className="absolute inset-y-0 left-0 z-30 overflow-hidden border-r border-zinc-800 bg-zinc-950 shadow-2xl"
+          >
+            <FileTree
+              root={cwd}
+              touched={touched}
+              reload={treeReload}
+              onOpen={(p) => void openFile(p)}
+            />
+          </aside>
+        )}
+        {viewer && layout.preview.mode === 'overlay' && (
+          <div
+            style={{ width: layout.preview.width }}
+            className="absolute inset-y-0 right-0 z-40 flex bg-zinc-950 shadow-2xl"
+          >
+            <FilePreview
+              preview={viewer}
+              workspaceRoot={cwd}
+              onClose={() => setViewer(null)}
+              onUseInPrompt={useSnippetInPrompt}
+            />
+          </div>
         )}
       </div>
 
