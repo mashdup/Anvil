@@ -39,6 +39,8 @@ const api = {
     | { kind: 'pdf' | 'docx'; dataB64: string }
     | { kind: 'binary' | 'too-large'; size: number }
   > => ipcRenderer.invoke('preview:read', root, file),
+  scanModels: (url: string, key: string): Promise<string[]> =>
+    ipcRenderer.invoke('models:scan', url, key),
   getMode: (cwd: string): Promise<PermissionMode> => ipcRenderer.invoke('mode:get', cwd),
   setMode: (cwd: string, mode: PermissionMode): Promise<void> =>
     ipcRenderer.invoke('mode:set', cwd, mode),

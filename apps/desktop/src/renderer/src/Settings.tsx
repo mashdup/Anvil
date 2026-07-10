@@ -15,6 +15,10 @@ interface ProfileRow {
   url: string
   key: string
   contextSize: string // free text while editing; parsed on save
+  // Transient "scan endpoint for models" UI state (never persisted).
+  scanning?: boolean
+  scanned?: string[]
+  scanError?: string
 }
 
 export function SettingsPanel({
@@ -65,6 +69,22 @@ export function SettingsPanel({
 
   const update = (i: number, patch: Partial<ProfileRow>): void => {
     setRows((prev) => prev!.map((r, idx) => (idx === i ? { ...r, ...patch } : r)))
+  }
+
+  const scanModels = async (i: number): Promise<void> => {
+    const row = rows?.[i]
+    if (!row) return
+    update(i, { scanning: true, scanError: undefined, scanned: undefined })
+    try {
+      const models = await window.codehamr.scanModels(row.url, row.key)
+      update(i, {
+        scanning: false,
+        scanned: models,
+        scanError: models.length ? undefined : 'endpoint returned no models',
+      })
+    } catch (e) {
+      update(i, { scanning: false, scanError: e instanceof Error ? e.message : String(e) })
+    }
   }
 
   const addProfile = (): void => {
@@ -264,7 +284,36 @@ export function SettingsPanel({
                   </button>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
-                  <Field label="model (llm)" value={r.llm} onChange={(v) => update(i, { llm: v })} placeholder="qwen3.6:27b / gpt-5.5" />
+                  <div>
+                    <div className="flex items-end gap-1.5">
+                      <div className="flex-1">
+                        <Field label="model (llm)" value={r.llm} onChange={(v) => update(i, { llm: v })} placeholder="qwen3.6:27b / gpt-5.5" />
+                      </div>
+                      <button
+                        onClick={() => void scanModels(i)}
+                        disabled={r.scanning || !r.url.trim()}
+                        title={r.url.trim() ? 'list the models this endpoint offers' : 'enter the endpoint URL first'}
+                        className="shrink-0 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs hover:bg-zinc-700 disabled:opacity-40"
+                      >
+                        {r.scanning ? 'Scanning…' : 'Scan'}
+                      </button>
+                    </div>
+                    {r.scanError && <p className="mt-1 text-[10px] text-red-400">{r.scanError}</p>}
+                    {r.scanned && r.scanned.length > 0 && (
+                      <select
+                        value=""
+                        onChange={(e) => e.target.value && update(i, { llm: e.target.value })}
+                        className="mt-1 w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs outline-none"
+                      >
+                        <option value="">{r.scanned.length} models found — pick one…</option>
+                        {r.scanned.map((m) => (
+                          <option key={m} value={m}>
+                            {m}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
                   <Field label="endpoint url" value={r.url} onChange={(v) => update(i, { url: v })} placeholder="http://localhost:11434" />
                   <Field label="api key" value={r.key} onChange={(v) => update(i, { key: v })} placeholder="empty for local · ${VAR} for env" password />
                   <Field label="context size (empty = server-managed)" value={r.contextSize} onChange={(v) => update(i, { contextSize: v })} placeholder="32768" />

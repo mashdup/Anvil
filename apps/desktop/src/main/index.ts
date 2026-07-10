@@ -570,6 +570,34 @@ function wireIpc(): void {
     writeFileSync(modesPath(), JSON.stringify(modes, null, 2), 'utf8')
   })
 
+  // Scan an OpenAI-compatible endpoint's model list (GET /v1/models). Runs in
+  // main to avoid the renderer's CSP and CORS. Ollama serves this too.
+  ipcMain.handle('models:scan', async (_evt, url: string, key: string) => {
+    const base = String(url).trim().replace(/\/+$/, '')
+    if (!base) throw new Error('enter an endpoint URL first')
+    // Expand a whole-key ${VAR} reference against the env, matching the agent.
+    const trimmedKey = String(key).trim()
+    const m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(trimmedKey)
+    const resolvedKey = m ? (process.env[m[1]] ?? '') : trimmedKey
+    let res: Response
+    try {
+      res = await fetch(`${base}/v1/models`, {
+        headers: resolvedKey ? { Authorization: `Bearer ${resolvedKey}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      })
+    } catch (e) {
+      throw new Error(`could not reach ${base} (${(e as Error).message})`)
+    }
+    if (!res.ok) {
+      throw new Error(`${base}/v1/models returned ${res.status} ${res.statusText}`)
+    }
+    const json = (await res.json()) as { data?: { id?: string }[] }
+    const ids = Array.isArray(json.data)
+      ? json.data.map((d) => d.id).filter((id): id is string => !!id)
+      : []
+    return ids.sort()
+  })
+
   ipcMain.handle('presets:list', async () => {
     const store = readPresets()
     return { defaultPreset: store.defaultPreset ?? null, presets: store.presets }
