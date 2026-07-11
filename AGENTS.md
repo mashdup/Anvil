@@ -36,6 +36,32 @@ CodeHamrUI/                     ← this repo (npm workspaces)
 `codehamr/` is a **git submodule** pointing at `github.com/mashdup/codehamr`
 (our fork). Changes to the agent are commits in that submodule, not this repo.
 
+## Key files
+
+Renderer — `apps/desktop/src/renderer/src/`:
+- `Workspace.tsx` — **the big one** (~2500 lines): chat transcript, composer,
+  tool cards, diffs, preview split, slash palette. The transcript `Item` /
+  `ToolStatus` / `Phase` types live at the top; most UI work lands here.
+- `App.tsx` — top level: workspace tabs, custom title bar, platform detection.
+- `Settings.tsx` — the `config.yaml` editor + `AppearanceModal` (theme picker).
+- `themes.ts` — theme engine (`SCHEMES`, `applyTheme`).
+- `FilePreview.tsx` / `FileTree.tsx` — file viewer / tree.
+- `BrowserPane.tsx` — live `<webview>` browser pane.
+- `syntax.ts` — highlight.js wrapper. `styles.css` — global styles + the two
+  fixed code/diff palettes.
+
+Main / preload — `apps/desktop/src/`:
+- `main/index.ts` — all IPC handlers (spawn, config, git diff-stat, clipboard,
+  model scan, presets, chats, window).
+- `main/agent/AgentSession.ts` — spawns `codehamr --json`; the NDJSON bridge.
+- `preload/index.ts` — the `window.codehamr` bridge (contextBridge).
+
+Agent — `codehamr/internal/`:
+- `protocol/protocol.go` — the NDJSON driver (Runner, turn loop, tool dispatch).
+- `llm/llm.go` — the only LLM client (OpenAI chat-completions).
+- `tools/` — bash / read_file / write_file / edit_file. `config/config.go` —
+  the `.codehamr/config.yaml` schema + bootstrap.
+
 ## The protocol is the contract (most important invariant)
 
 The wire protocol is defined in **two files that must stay in lockstep**:
@@ -74,6 +100,58 @@ renderer  ◀──AgentEvent──  main (parseAgentLine)  ◀──stdout NDJS
 NDJSON bridge. The whole renderer speaks only `AgentEvent`/`Command`; swapping
 the backend would mean writing one adapter that presents this interface.
 
+## Agent tools & approvals
+
+The agent exposes four real tools plus two harness-only ones:
+- `bash`, `read_file`, `write_file`, `edit_file` — real side effects.
+- `preview_file`, `preview_url` — harness-only. They emit a `preview` event the
+  GUI turns into an open file/browser panel; no shell, no approval, nothing
+  returned to the model. Defined in `protocol.go`; the standalone TUI never sees
+  them.
+
+Permission modes (`set_mode`): **ask** gates every side-effecting tool behind the
+harness's allow/deny handshake — a `tool_call` with `needsApproval:true`, answered
+by an `approve` command keyed on `callId`. **auto** runs them unattended.
+`read_file` is always allowed; a session-scoped allow skips the gate for later
+calls of the same tool.
+
+## Persistence & config
+
+Per-workspace state lives in `.codehamr/`:
+- `config.yaml` — model profiles (below); strict schema.
+- `session.json` — the **agent's** conversation history (what's sent to the
+  model). This is what `/compact` rewrites.
+- `transcript.json` — the **renderer's** rich transcript (tool cards, diffs).
+  Distinct from `session.json`, so compacting the agent's memory doesn't erase
+  the visible chat.
+- `chats/` — archived per-project chat sessions; `history` — prompt recall.
+
+App-global state (config presets, per-workspace permission mode, window state)
+lives in Electron's `userData`, not the project.
+
+`config.yaml` shape:
+```yaml
+active: local                 # which profile to use
+models:
+  local:
+    llm: gemma                 # model id sent as `model` on the wire
+    url: https://…             # OpenAI-compatible base, WITHOUT /v1
+    key: ${MY_KEY}             # ${VAR} expands from env; keeps secrets off disk
+    context_size: 32768        # optional; the server X-Context-Window wins
+logging: false                 # optional
+```
+Unknown top-level keys make the agent refuse to start. Settings-panel edits and
+`models:scan` (GET `<url>/v1/models`) write/populate this file.
+
+## Tests & CI
+
+- **Go tests** live in the submodule: `cd codehamr && go test ./...` (protocol,
+  tools, config, llm, ctx, diff, tree). `.github/workflows/ci.yml` runs `go vet`
+  + full tests on Linux and protocol/tools tests on Windows for every push to
+  `main` and every PR.
+- There is **no JS/TS test or lint suite** — `npm run typecheck` and
+  `npm run build` are the gate for the desktop app.
+
 ## Commands
 
 Run from the repo root:
@@ -109,6 +187,11 @@ Run from the repo root:
 - **Tailwind v4** compiles utilities to `var(--color-*)`, which is what powers
   runtime theming — overriding CSS custom properties on `<html>` (see
   `renderer/src/themes.ts`) re-themes everything with zero component changes.
+- **Code and diff surfaces are deliberately NOT themed.** They use a fixed pair
+  of palettes (`--code-*` / `--diff-*` on `:root` vs `:root[data-light]` in
+  `styles.css`) — dark-on-dark for dark themes, light-on-light for light themes —
+  so syntax and diffs stay readable regardless of the user's accent/surface tint.
+  Don't swap these for themed `zinc`/`emerald` classes.
 - **LLM endpoints must be OpenAI-compatible and serve `/v1/chat/completions`.**
   The Go client (`codehamr/internal/llm/llm.go`) hardcodes `<url>/v1/chat/
   completions`; the config `url` is the base *before* `/v1`. Providers that use a
