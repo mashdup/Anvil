@@ -2,8 +2,16 @@ name: Release
 
 # Tag v* (matching apps/desktop/package.json's version, e.g. v0.1.0) to build
 # installers with the bundled agent and publish them to a GitHub Release.
-# electron-builder's github publisher creates/updates a draft release for the
-# tag; review and publish it from the Releases page.
+#
+# Design: the two platform jobs BUILD ONLY (`electron-builder --publish never`)
+# and upload their outputs as workflow artifacts. A single `release` job then
+# creates ONE draft release and attaches everything.
+#
+# Why not let each platform publish itself: electron-builder's github publisher
+# finds-or-creates a draft by tag, but a draft's tag isn't a real git ref, so a
+# second job can't reliably see the first job's in-flight draft — you get two
+# drafts for the same tag. Serializing the jobs didn't fix it. Funnelling all
+# uploads through one publisher does: one publisher, one draft.
 on:
   push:
     tags: ['v*']
@@ -31,20 +39,21 @@ jobs:
         run: npm run agent:build
       - name: build app
         run: npm run build
-      - name: package + publish NSIS installer
-        run: npx electron-builder --win --publish always
+      - name: package NSIS installer (build only)
+        run: npx electron-builder --win --publish never
         working-directory: apps/desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
+            apps/desktop/release/latest.yml
+          if-no-files-found: error
 
   macos:
     runs-on: macos-latest # arm64; dmg targets arm64 (see electron-builder.yml)
-    # Run AFTER the windows job, not in parallel. electron-builder's github
-    # publisher finds-or-creates a draft release by tag; two jobs publishing at
-    # the same instant each fail to see the other's in-flight draft and create
-    # their own → two drafts, same tag. Serializing means windows creates the
-    # draft and macos appends its dmg/zip/latest-mac.yml to that same draft.
-    needs: windows
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,23 +71,45 @@ jobs:
         run: npm run agent:build
       - name: build app
         run: npm run build
-      - name: package + publish dmg
-        run: npx electron-builder --mac --publish always
+      - name: package dmg + zip (build only)
+        run: npx electron-builder --mac --publish never
         working-directory: apps/desktop
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple signing + notarization, driven entirely by repo secrets:
-          #   MAC_CERT_P12         base64 of the Developer ID Application .p12
-          #   MAC_CERT_PASSWORD    the .p12 export password
-          #   APPLE_ID             Apple ID email
-          #   APPLE_APP_SPECIFIC_PASSWORD  from appleid.apple.com
-          #   APPLE_TEAM_ID        10-char team id from the developer portal
-          # With the secrets unset these env vars are empty strings, which
-          # electron-builder treats as absent: the build stays unsigned and
-          # auto-discovery is disabled so the runner keychain can't interfere.
+          # Apple signing + notarization, driven entirely by repo secrets (see
+          # electron-builder.yml). With the secrets unset these are empty strings,
+          # which electron-builder treats as absent: the build stays unsigned.
           CSC_LINK: ${{ secrets.MAC_CERT_P12 }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERT_P12 != '' && 'true' || 'false' }}
+      - name: upload macos artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.dmg.blockmap
+            apps/desktop/release/*-mac.zip
+            apps/desktop/release/*-mac.zip.blockmap
+            apps/desktop/release/latest-mac.yml
+          if-no-files-found: error
+
+  # Single publisher: collect both platforms' artifacts and create ONE draft
+  # release. Runs only after both builds succeed.
+  release:
+    runs-on: ubuntu-latest
+    needs: [windows, macos]
+    steps:
+      - name: download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten dist-windows/ + dist-macos/ into dist/
+      - name: publish single draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          fail_on_unmatched_files: true
