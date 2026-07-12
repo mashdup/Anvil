@@ -150,7 +150,12 @@ export const ToolCallEvent = z.object({
   v: z.literal(PROTOCOL_VERSION),
   type: z.literal('tool_call'),
   callId: z.string(),
-  name: z.enum(['bash', 'read_file', 'write_file', 'edit_file']),
+  // Permissive by design: any non-empty tool name renders as a card. A strict
+  // enum here means every new tool the binary adds degrades to a raw-JSON noise
+  // line until this list is hand-edited — the renderer already has generic
+  // summary/color fallbacks (see toolSummary / toolColorClass) for names it
+  // doesn't specifically know.
+  name: z.string().min(1),
   args: z.record(z.string(), z.unknown()),
   needsApproval: z.boolean(),
 })

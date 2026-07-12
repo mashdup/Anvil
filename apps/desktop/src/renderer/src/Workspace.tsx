@@ -98,6 +98,22 @@ function toolLabel(name: string, args: Record<string, unknown>): string {
       return file(args.path) ? `writing ${file(args.path)}` : 'writing file'
     case 'edit_file':
       return file(args.path) ? `editing ${file(args.path)}` : 'editing file'
+    case 'multi_edit':
+      return file(args.path) ? `editing ${file(args.path)}` : 'editing file'
+    case 'grep': {
+      const p = typeof args.pattern === 'string' ? args.pattern : ''
+      return p ? `searching for ${clip(p, 30)}` : 'searching'
+    }
+    case 'glob': {
+      const p = typeof args.pattern === 'string' ? args.pattern : ''
+      return p ? `finding ${clip(p, 30)}` : 'finding files'
+    }
+    case 'web_fetch': {
+      const u = typeof args.url === 'string' ? args.url : ''
+      return u ? `fetching ${clip(u, 40)}` : 'fetching page'
+    }
+    case 'todo_write':
+      return 'updating plan'
     case 'preview_file':
       return 'opening preview'
     case 'preview_url':
@@ -906,7 +922,7 @@ export default function Workspace({
     for (const it of items) {
       if (
         it.kind === 'tool' &&
-        (it.name === 'write_file' || it.name === 'edit_file') &&
+        (it.name === 'write_file' || it.name === 'edit_file' || it.name === 'multi_edit') &&
         it.status === 'done'
       ) {
         const p = String(it.args.path ?? '')
@@ -2516,6 +2532,63 @@ const statusLabel: Record<ToolStatus, string> = {
   denied: 'denied',
 }
 
+/**
+ * Per-tool accent color for the name label, so the eye can triage a transcript
+ * at a glance: amber = shell, sky = read-only inspection, emerald = file
+ * mutations, violet = planning. Full literal classes so Tailwind's JIT keeps
+ * them.
+ */
+const toolColor: Record<string, string> = {
+  bash: 'text-amber-400',
+  read_file: 'text-sky-400',
+  grep: 'text-sky-400',
+  glob: 'text-sky-400',
+  web_fetch: 'text-cyan-400',
+  write_file: 'text-emerald-400',
+  edit_file: 'text-emerald-400',
+  multi_edit: 'text-emerald-400',
+  todo_write: 'text-violet-400',
+}
+
+const toolColorClass = (name: string): string => toolColor[name] ?? 'text-zinc-400'
+
+/**
+ * One-line summary shown in a tool card header. Each tool's most telling
+ * argument: the command for bash, the pattern for grep/glob, the path for the
+ * file tools, the url for web_fetch, an item count for todo_write. Falls back
+ * to the raw args so an unknown tool still shows something readable.
+ */
+function toolSummary(name: string, args: Record<string, unknown>): string {
+  switch (name) {
+    case 'bash':
+      return String(args.cmd ?? '')
+    case 'grep':
+    case 'glob': {
+      const pattern = String(args.pattern ?? '')
+      const scope = args.path ? ` in ${args.path}` : ''
+      const include = args.include ? ` (${args.include})` : ''
+      return `${pattern}${include}${scope}`
+    }
+    case 'web_fetch':
+      return String(args.url ?? '')
+    case 'multi_edit': {
+      const path = String(args.path ?? '')
+      const n = Array.isArray(args.edits) ? args.edits.length : 0
+      return n ? `${path} (${n} edit${n === 1 ? '' : 's'})` : path
+    }
+    case 'todo_write': {
+      const n = Array.isArray(args.todos) ? args.todos.length : 0
+      return `${n} item${n === 1 ? '' : 's'}`
+    }
+    case 'read_file':
+    case 'write_file':
+    case 'edit_file':
+      return String(args.path ?? '')
+    default:
+      return String(args.path ?? args.url ?? JSON.stringify(args))
+  }
+}
+
 function ToolCard({
   item,
   onDecide,
@@ -2528,10 +2601,7 @@ function ToolCard({
   embedded?: boolean
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
-  const summary =
-    item.name === 'bash'
-      ? String(item.args.cmd ?? '')
-      : String(item.args.path ?? item.args.url ?? JSON.stringify(item.args))
+  const summary = toolSummary(item.name, item.args)
 
   return (
     <div
@@ -2541,7 +2611,7 @@ function ToolCard({
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 px-3 py-2 text-left"
       >
-        <span className="font-mono text-xs text-amber-400">{item.name}</span>
+        <span className={`font-mono text-xs ${toolColorClass(item.name)}`}>{item.name}</span>
         <span className="truncate font-mono text-xs text-zinc-400">{summary}</span>
         {item.background && (
           <span
@@ -2621,7 +2691,7 @@ function ToolGroupCard({
   const active = tools.some((t) => t.status === 'pending_approval' || t.status === 'running')
   const expanded = open || active
   const failed = tools.filter((t) => t.status === 'failed' || t.status === 'denied').length
-  const names = [...new Set(tools.map((t) => t.name))].join(', ')
+  const uniqueNames = [...new Set(tools.map((t) => t.name))]
   const hasBackground = tools.some((t) => t.background)
   return (
     <div className="max-w-[var(--msg-max,85%)] rounded-lg border border-zinc-800 bg-zinc-900/40 text-sm">
@@ -2633,7 +2703,14 @@ function ToolGroupCard({
         <span className="text-xs text-zinc-300">
           {tools.length} tool call{tools.length === 1 ? '' : 's'}
         </span>
-        <span className="truncate font-mono text-xs text-zinc-500">{names}</span>
+        <span className="flex min-w-0 gap-1.5 truncate font-mono text-xs">
+          {uniqueNames.map((n, i) => (
+            <span key={n} className={toolColorClass(n)}>
+              {n}
+              {i < uniqueNames.length - 1 ? ',' : ''}
+            </span>
+          ))}
+        </span>
         {hasBackground && (
           <span
             title="a background process is still running after the shell exited"
