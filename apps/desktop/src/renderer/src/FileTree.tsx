@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ChangedPaths, GitChangeKind } from './workspace/useGitStatus'
 
 /**
  * FileTree: a drill-in file browser for the open workspace. Instead of an
  * ever-expanding tree, clicking a folder navigates INTO it (showing just that
- * folder's contents); a breadcrumb bar walks back up. `touched` files get an
- * emerald dot, and so does any folder with a `touched` file nested anywhere
- * inside it, so change indicators aren't buried below collapsed folders.
- * `reload` re-fetches the current folder when it changes on disk.
+ * folder's contents); a breadcrumb bar walks back up. Files with uncommitted
+ * git changes get a colored dot (amber = modified, green = added/untracked),
+ * and so does any folder containing a changed file nested anywhere inside it,
+ * so change indicators aren't buried below collapsed folders. Files the agent
+ * edited this session but that git doesn't flag (e.g. reverted, or outside a
+ * repo) fall back to an emerald "touched" dot. `reload` re-fetches the current
+ * folder when it changes on disk.
  *
  * A single directory level is small enough to render directly (capped at CAP
  * rows), so there's no windowing/virtualization — the hand-rolled version left
@@ -30,11 +34,13 @@ const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?
 export function FileTree({
   root,
   touched,
+  changed,
   reload,
   onOpen,
 }: {
   root: string
   touched: Set<string>
+  changed: ChangedPaths
   reload: { dirs: string[]; nonce: number } | null
   onOpen: (path: string) => void
 }): React.JSX.Element {
@@ -102,6 +108,36 @@ export function FileTree({
 
   const shown = entries.slice(0, CAP)
 
+  // Color for a git change kind: amber = modified, green = added/untracked.
+  // Inline hex (not a Tailwind class) so a dynamically-selected color can never
+  // be missed by the JIT scanner.
+  const kindColor = (k: GitChangeKind): string =>
+    k === 'modified' ? '#fbbf24' /* amber-400 */ : '#34d399' /* emerald-400 */
+
+  // A folder's rolled-up git status: the "strongest" change of any file nested
+  // anywhere inside it. `changed` is keyed by lowercased, forward-slashed
+  // absolute paths; match by directory prefix so nesting depth doesn't matter.
+  // Modified outranks added/untracked so an edited file isn't masked by a new
+  // sibling. Memoized per render over the (small) changed set.
+  const dirKind = useCallback(
+    (folderPath: string): GitChangeKind | null => {
+      if (changed.size === 0) return null
+      const prefix = folderPath.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '') + '/'
+      let found: GitChangeKind | null = null
+      for (const [p, k] of changed) {
+        if (!p.startsWith(prefix)) continue
+        if (k === 'modified') return 'modified'
+        found = k
+      }
+      return found
+    },
+    [changed],
+  )
+
+  // A file's own git change kind, if any.
+  const fileKind = (filePath: string): GitChangeKind | null =>
+    changed.get(filePath.replace(/\\/g, '/').toLowerCase()) ?? null
+
   // A folder shows the change dot when any touched file is nested anywhere
   // inside it. `touched` holds lowercased, forward-slashed absolute paths;
   // match by directory prefix so nesting depth doesn't matter.
@@ -140,8 +176,33 @@ export function FileTree({
         {!loading && entries.length === 0 && (
           <p className="px-3 py-2 text-zinc-600">empty folder</p>
         )}
-        {shown.map((entry) =>
-          entry.isDir ? (
+        {shown.map((entry) => {
+          // Change dot: git status first (persists across sessions), then fall
+          // back to a session-touched dot when git doesn't flag it.
+          const gitK = entry.isDir ? dirKind(entry.path) : fileKind(entry.path)
+          const isTouched = entry.isDir
+            ? dirTouched(entry.path)
+            : touched.has(entry.path.toLowerCase())
+          const dotColor = gitK ? kindColor(gitK) : isTouched ? '#34d399' : null
+          const dotTitle = gitK
+            ? entry.isDir
+              ? `contains ${gitK === 'modified' ? 'modified' : 'new'} files (uncommitted)`
+              : gitK === 'modified'
+                ? 'modified — uncommitted change'
+                : gitK === 'added'
+                  ? 'added — staged, uncommitted'
+                  : 'untracked — new file'
+            : entry.isDir
+              ? 'contains files edited by the agent this session'
+              : 'edited by the agent this session'
+          const dot = dotColor ? (
+            <span
+              className="h-1.5 w-1.5 shrink-0 rounded-full"
+              style={{ background: dotColor }}
+              title={dotTitle}
+            />
+          ) : null
+          return entry.isDir ? (
             <button
               key={entry.path}
               onClick={() => navigate(entry.path)}
@@ -149,17 +210,8 @@ export function FileTree({
             >
               <span className="shrink-0 text-amber-500/80">▸</span>
               <span className="truncate">{entry.name}</span>
-              {dirTouched(entry.path) && (
-                <span
-                  className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
-                  title="contains files edited by the agent this session"
-                />
-              )}
-              <span
-                className={`shrink-0 text-zinc-600 ${dirTouched(entry.path) ? 'ml-1' : 'ml-auto'}`}
-              >
-                ›
-              </span>
+              {dot && <span className="ml-auto flex shrink-0 items-center">{dot}</span>}
+              <span className={`shrink-0 text-zinc-600 ${dot ? 'ml-1' : 'ml-auto'}`}>›</span>
             </button>
           ) : (
             <button
@@ -170,15 +222,10 @@ export function FileTree({
             >
               <span className="w-2 shrink-0" />
               <span className="truncate">{entry.name}</span>
-              {touched.has(entry.path.toLowerCase()) && (
-                <span
-                  className="ml-auto mr-1 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
-                  title="edited by the agent this session"
-                />
-              )}
+              {dot && <span className="mr-1 ml-auto flex shrink-0 items-center">{dot}</span>}
             </button>
-          ),
-        )}
+          )
+        })}
         {entries.length > CAP && (
           <p className="px-3 py-2 text-zinc-600">
             showing first {CAP} of {entries.length} entries

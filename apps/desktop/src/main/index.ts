@@ -369,6 +369,119 @@ async function gitFileChanges(cwd: string, abs: string): Promise<GitLineChanges 
 }
 
 /**
+ * Full unified diff of one file vs HEAD, for the preview's "Diff" view. Uses
+ * `git diff HEAD` (3 lines of context) for a tracked file; for an untracked
+ * (new, non-ignored) file synthesizes an all-added diff against /dev/null so
+ * new files show something too. Returns null when it's not a repo, git is
+ * missing, the file is unchanged, binary, or outside the repo — the UI then
+ * keeps the diff toggle hidden.
+ */
+async function gitFileDiff(cwd: string, abs: string): Promise<string | null> {
+  const rel = relative(cwd, abs)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null // outside the repo
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  const tracked = await run(['ls-files', '--error-unmatch', '--', rel])
+  if (tracked === null) {
+    // Untracked new file: show an all-added diff, but only if git considers it
+    // a candidate (respects .gitignore) and it's real text.
+    const others = await run(['ls-files', '--others', '--exclude-standard', '--', rel])
+    if (!others || !others.trim()) return null // ignored / not a repo / git missing
+    try {
+      const buf = await readFile(abs)
+      if (buf.subarray(0, 8192).includes(0)) return null // binary
+      const text = buf.toString('utf8')
+      const lines = text.length ? text.replace(/\n$/, '').split('\n') : []
+      const body = lines.map((l) => `+${l}`).join('\n')
+      const noNewline = text.length && !text.endsWith('\n') ? '\n\\ No newline at end of file' : ''
+      return (
+        `diff --git a/${rel} b/${rel}\n` +
+        `new file\n` +
+        `--- /dev/null\n` +
+        `+++ b/${rel}\n` +
+        `@@ -0,0 +1,${lines.length} @@\n` +
+        body +
+        noNewline
+      )
+    } catch {
+      return null
+    }
+  }
+  const out = await run(['diff', 'HEAD', '--no-color', '--', rel])
+  if (out === null || out.trim() === '') return null // unchanged
+  return out
+}
+
+/** Working-tree git status for the file tree: absolute paths of changed files,
+ *  split by kind so the UI can tint them. `modified` covers tracked edits and
+ *  deletions; `added` covers staged new files; `untracked` covers new,
+ *  non-ignored files. */
+export interface GitStatus {
+  modified: string[]
+  added: string[]
+  untracked: string[]
+}
+
+/**
+ * Working-tree changes vs the index/HEAD for the whole workspace, feeding the
+ * file browser's change indicators (like an editor's source-control coloring).
+ * Uses `git status --porcelain=v1 -z -uall`: NUL-delimited (safe for any path),
+ * untracked directories expanded to individual files. Porcelain paths are
+ * relative to the repo TOPLEVEL (not cwd), so they're resolved against it and
+ * returned absolute. Returns null when it's not a repo / git is missing (the UI
+ * then shows a plain tree).
+ */
+async function gitStatus(cwd: string): Promise<GitStatus | null> {
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  // Repo root as a path RELATIVE to cwd (`--show-cdup`), not the absolute
+  // `--show-toplevel` — the latter resolves symlinks (/tmp → /private/tmp on
+  // macOS), which would no longer prefix-match the tree's cwd-rooted paths.
+  const cdup = await run(['rev-parse', '--show-cdup'])
+  if (cdup === null) return null // not a repo / git missing
+  const rootDir = resolve(cwd, cdup.trim())
+  const out = await run(['status', '--porcelain=v1', '-z', '-uall', '--no-renames'])
+  if (out === null) return null
+  const modified: string[] = []
+  const added: string[] = []
+  const untracked: string[] = []
+  // Records are NUL-separated: "XY <path>". X=index status, Y=worktree status.
+  for (const rec of out.split('\0')) {
+    if (rec.length < 4) continue
+    const x = rec[0]
+    const y = rec[1]
+    const rel = rec.slice(3)
+    if (!rel) continue
+    const abs = join(rootDir, rel)
+    if (x === '?' || y === '?') untracked.push(abs)
+    else if (x === 'A') added.push(abs)
+    else modified.push(abs) // M, D, R, C, and any index/worktree edit
+  }
+  if (!modified.length && !added.length && !untracked.length) return null
+  return { modified, added, untracked }
+}
+
+/**
  * Current git branch for the workspace, for the header indicator. Returns the
  * branch name, or the short commit SHA when HEAD is detached, or null when it's
  * not a git repo / git is missing (the UI then hides the indicator).
@@ -516,6 +629,10 @@ function wireIpc(): void {
   ipcMain.handle('git:filechanges', async (_evt, cwd: string, abs: string) =>
     gitFileChanges(cwd, abs),
   )
+  ipcMain.handle('git:filediff', async (_evt, cwd: string, abs: string) =>
+    gitFileDiff(cwd, abs),
+  )
+  ipcMain.handle('git:status', async (_evt, cwd: string) => gitStatus(cwd))
   ipcMain.handle('git:branch', async (_evt, cwd: string) => gitBranch(cwd))
 
   // System clipboard access for the composer's right-click menu. Routed

@@ -202,7 +202,7 @@ export function SettingsPanel({
   return (
     <div className="fixed inset-0 z-10 flex items-center justify-center bg-black/60" onClick={onClose}>
       <div
-        className="max-h-[85vh] w-[720px] max-w-[95vw] overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-5"
+        className="max-h-[90vh] w-[920px] max-w-[95vw] overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center">
@@ -410,14 +410,17 @@ export function SettingsPanel({
 /**
  * MemorySection: view / edit / download / load the project's persistent memory
  * - the out-of-repo facts the agent accumulates via its `remember` tool and
- * reads into every new chat. Edits are staged locally; Save writes the file
- * (no agent restart needed - memory is read fresh at the start of each chat).
+ * reads into every new chat. Facts show as a card list (date + text, newest
+ * first); an Edit toggle drops to the raw text for hand-editing. Edits are
+ * staged locally; Save writes the file (no agent restart needed - memory is
+ * read fresh at the start of each chat).
  */
 function MemorySection({ workspace }: { workspace: string }): React.JSX.Element {
   const [text, setText] = useState<string | null>(null)
   const [saved, setSaved] = useState('') // last-persisted content, to detect edits
   const [status, setStatus] = useState('')
   const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(false)
 
   useEffect(() => {
     void window.codehamr.readMemory(workspace).then((m) => {
@@ -427,6 +430,7 @@ function MemorySection({ workspace }: { workspace: string }): React.JSX.Element 
   }, [workspace])
 
   const dirty = text !== null && text !== saved
+  const facts = text !== null ? parseMemory(text) : []
 
   const save = async (): Promise<void> => {
     if (text === null) return
@@ -460,7 +464,7 @@ function MemorySection({ workspace }: { workspace: string }): React.JSX.Element 
       const content = await window.codehamr.importMemory()
       if (content !== null) {
         setText(content)
-        setStatus('loaded into the editor — review, then Save to apply')
+        setStatus('loaded — review, then Save to apply')
       }
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -469,7 +473,14 @@ function MemorySection({ workspace }: { workspace: string }): React.JSX.Element 
 
   const clear = (): void => {
     setText('')
-    setStatus('cleared in the editor — Save to wipe stored memory')
+    setStatus('cleared — Save to wipe stored memory')
+  }
+
+  // Drop one fact card: rebuild the raw text without its line. Save persists.
+  const removeFact = (idx: number): void => {
+    const next = facts.filter((_, i) => i !== idx)
+    setText(serializeMemory(next))
+    setStatus('removed — Save to apply')
   }
 
   return (
@@ -484,14 +495,61 @@ function MemorySection({ workspace }: { workspace: string }): React.JSX.Element 
         <p className="py-4 text-center text-sm text-zinc-500">Loading…</p>
       ) : (
         <>
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            spellCheck={false}
-            placeholder="No memory yet — the agent adds facts here as it works, or you can write your own."
-            className="h-40 w-full resize-y rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 font-mono text-xs leading-relaxed outline-none focus:border-zinc-500"
-          />
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+          <div className="mb-2 flex items-center gap-2">
+            <span className="text-xs text-zinc-500">
+              {facts.length} fact{facts.length === 1 ? '' : 's'}
+            </span>
+            <button
+              onClick={() => setEditing((e) => !e)}
+              className={`ml-auto rounded px-2 py-0.5 text-[11px] hover:bg-zinc-700 ${
+                editing ? 'bg-zinc-700 text-zinc-100' : 'bg-zinc-800 text-zinc-400'
+              }`}
+            >
+              {editing ? '✓ Editing raw' : 'Edit raw'}
+            </button>
+          </div>
+
+          {editing ? (
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              spellCheck={false}
+              placeholder="No memory yet — the agent adds facts here as it works, or you can write your own."
+              className="h-72 w-full resize-y rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 font-mono text-xs leading-relaxed outline-none focus:border-zinc-500"
+            />
+          ) : facts.length === 0 ? (
+            <p className="rounded border border-dashed border-zinc-800 py-8 text-center text-sm text-zinc-600">
+              No memory yet — the agent adds facts here as it works.
+            </p>
+          ) : (
+            <div className="max-h-[52vh] space-y-1.5 overflow-y-auto pr-1">
+              {facts.map((f, i) => (
+                <div
+                  key={i}
+                  className="group flex items-start gap-2.5 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2"
+                >
+                  <span className="mt-0.5 shrink-0 text-fuchsia-400" title="a remembered fact">
+                    ★
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm leading-relaxed break-words whitespace-pre-wrap text-zinc-200">
+                      {f.fact}
+                    </p>
+                    {f.date && <p className="mt-0.5 text-[10px] text-zinc-600">{f.date}</p>}
+                  </div>
+                  <button
+                    onClick={() => removeFact(i)}
+                    title="remove this fact (Save to apply)"
+                    className="shrink-0 rounded px-1 text-zinc-600 opacity-0 group-hover:opacity-100 hover:bg-red-950 hover:text-red-400"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
               onClick={() => void save()}
               disabled={busy || !dirty}
@@ -524,6 +582,38 @@ function MemorySection({ workspace }: { workspace: string }): React.JSX.Element 
       )}
     </div>
   )
+}
+
+type MemoryFact = { date: string | null; fact: string }
+
+/**
+ * Parse the memory file into fact cards. Each entry is a `- <date> <fact>`
+ * bullet (the Go `remember` tool's format); a continuation line without a
+ * bullet is appended to the previous fact. Non-bullet leading prose (rare) is
+ * ignored so only real facts become cards. Newest first for display.
+ */
+function parseMemory(text: string): MemoryFact[] {
+  const facts: MemoryFact[] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.trimEnd()
+    const m = /^-\s+(?:(\d{4}-\d{2}-\d{2})\s+)?(.*)$/.exec(line)
+    if (m) {
+      facts.push({ date: m[1] ?? null, fact: m[2] })
+    } else if (line.trim() && facts.length) {
+      // Continuation of the previous fact (wrapped line).
+      facts[facts.length - 1].fact += '\n' + line
+    }
+  }
+  return facts.reverse() // newest first
+}
+
+/** Rebuild the raw memory text from fact cards (oldest-first, as on disk). */
+function serializeMemory(facts: MemoryFact[]): string {
+  const oldestFirst = [...facts].reverse()
+  return oldestFirst
+    .map((f) => `- ${f.date ? f.date + ' ' : ''}${f.fact}`)
+    .join('\n')
+    .concat(oldestFirst.length ? '\n' : '')
 }
 
 /**

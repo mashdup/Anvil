@@ -1,387 +1,23 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import remarkBreaks from 'remark-breaks'
-import { highlight } from './syntax'
-import type { AgentEvent, ModelProfile, PermissionMode, TurnDoneEvent } from '@codehamr-ui/protocol'
+import type { AgentEvent, ModelProfile, PermissionMode } from '@codehamr-ui/protocol'
 import { PROTOCOL_VERSION } from '@codehamr-ui/protocol'
 import { AppearanceModal, SettingsPanel } from './Settings'
 import { FileTree } from './FileTree'
-import { FilePreview, type Preview } from './FilePreview'
+import { FilePreview } from './FilePreview'
 import { BrowserPane } from './BrowserPane'
-
-// Module-scoped so ids stay unique across every workspace tab.
-let nextId = 0
-const uid = (): string => `i${nextId++}`
-
-// ---------------------------------------------------------------------------
-// Transcript model: the renderer's view of the conversation, built by folding
-// protocol events. Kept deliberately flat — one array, discriminated items.
-// ---------------------------------------------------------------------------
-
-type ToolStatus = 'pending_approval' | 'running' | 'done' | 'failed' | 'denied'
-
-type Item =
-  | { kind: 'user'; id: string; text: string; images?: string[]; files?: string[]; pinned?: boolean } // data: URLs, file names
-  | { kind: 'assistant'; id: string; text: string; streaming: boolean; pinned?: boolean }
-  | { kind: 'reasoning'; id: string; text: string; streaming: boolean }
-  | {
-      kind: 'tool'
-      id: string // callId
-      name: string
-      args: Record<string, unknown>
-      status: ToolStatus
-      output?: string
-      background?: boolean // bash left a process running past the turn
-      diff?: { path: string; unifiedDiff: string }
-    }
-  | { kind: 'notice'; id: string; text: string; tone: 'info' | 'error' }
-
-type ToolItem = Extract<Item, { kind: 'tool' }>
-
-/**
- * Phase drives the live status bar. Local models can be silent for minutes
- * during prefill, and reasoning models think before answering — without this
- * the app looks hung exactly when the agent is working hardest.
- */
-type Phase = 'idle' | 'waiting' | 'thinking' | 'streaming' | 'tool'
-
-/** Which preview panels are open, in stacking order (top → bottom). */
-type PreviewPanel = 'file' | 'browser'
-
-// Slash commands available from the composer. `arg` (when set) means the
-// command takes an argument, so completing it inserts a trailing space instead
-// of running immediately. Handlers live in runSlash inside the component.
-type SlashCmd = { name: string; desc: string; arg?: string }
-const SLASH_COMMANDS: SlashCmd[] = [
-  { name: '/compact', desc: 'Summarize the conversation to reclaim context' },
-  { name: '/model', desc: 'Switch model', arg: '<name>' },
-  { name: '/clear', desc: 'Reset the conversation' },
-  { name: '/help', desc: 'List slash commands' },
-]
-
-/**
- * Attachments are either images (sent as multimodal content parts, model
- * permitting) or text files (inlined into the prompt with their absolute
- * path, so the agent can go straight to read_file/edit_file on them).
- */
-type ImageAttachment = { kind: 'image'; mime: string; dataB64: string }
-type FileAttachment = {
-  kind: 'file'
-  name: string
-  path: string // '' for pasted/synthetic files with no filesystem path
-  text: string
-  truncated: boolean
-}
-type Attachment = ImageAttachment | FileAttachment
-
-const MAX_ATTACHMENTS = 6
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024
-const MAX_FILE_BYTES = 2 * 1024 * 1024 // refuse to even read past this
-const MAX_INLINE_CHARS = 60_000 // ~15k tokens; the rest is a read_file away
-
-/** Last path segment, for the auto-mode banner and file chips. */
-const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p
-
-/** Human status line for a running tool: what it's doing, not just its name. */
-function toolLabel(name: string, args: Record<string, unknown>): string {
-  const file = (p: unknown): string => (typeof p === 'string' && p ? basename(p) : '')
-  const clip = (s: string, n = 44): string => (s.length > n ? s.slice(0, n) + '…' : s)
-  switch (name) {
-    case 'bash': {
-      const cmd = typeof args.cmd === 'string' ? args.cmd : typeof args.command === 'string' ? args.command : ''
-      return cmd ? `running: ${clip(cmd.replace(/\s+/g, ' ').trim())}` : 'running command'
-    }
-    case 'read_file':
-      return file(args.path) ? `reading ${file(args.path)}` : 'reading file'
-    case 'write_file':
-      return file(args.path) ? `writing ${file(args.path)}` : 'writing file'
-    case 'edit_file':
-      return file(args.path) ? `editing ${file(args.path)}` : 'editing file'
-    case 'multi_edit':
-      return file(args.path) ? `editing ${file(args.path)}` : 'editing file'
-    case 'grep': {
-      const p = typeof args.pattern === 'string' ? args.pattern : ''
-      return p ? `searching for ${clip(p, 30)}` : 'searching'
-    }
-    case 'glob': {
-      const p = typeof args.pattern === 'string' ? args.pattern : ''
-      return p ? `finding ${clip(p, 30)}` : 'finding files'
-    }
-    case 'web_fetch': {
-      const u = typeof args.url === 'string' ? args.url : ''
-      return u ? `fetching ${clip(u, 40)}` : 'fetching page'
-    }
-    case 'todo_write':
-      return 'updating plan'
-    case 'remember': {
-      const f = typeof args.fact === 'string' ? args.fact : ''
-      return f ? `remembering: ${clip(f)}` : 'saving to project memory'
-    }
-    case 'preview_file':
-      return 'opening preview'
-    case 'preview_url':
-      return 'opening browser'
-    default:
-      return `running ${name}`
-  }
-}
-
-/** Panel width persisted app-wide so it survives restarts and new tabs. */
-function usePanelWidth(
-  key: string,
-  initial: number,
-): [number, (updater: (w: number) => number) => void] {
-  const [w, setW] = useState(() => {
-    const s = Number(localStorage.getItem(`chpanel:${key}`))
-    return Number.isFinite(s) && s > 0 ? s : initial
-  })
-  const set = useCallback(
-    (updater: (w: number) => number) =>
-      setW((prev) => {
-        const next = updater(prev)
-        localStorage.setItem(`chpanel:${key}`, String(next))
-        return next
-      }),
-    [key],
-  )
-  return [w, set]
-}
-
-/**
- * A full-viewport transparent overlay held up for the duration of a divider
- * drag. Electron's <webview> (and any iframe) runs out-of-process and swallows
- * mouse events the instant the cursor crosses it, which strands the drag's
- * document-level listeners — the pointer "escapes" and the drag goes haywire.
- * The shield sits on top so every move/up lands in this document instead, and
- * carries the resize cursor across the whole window. Returns a remover.
- */
-function beginDragShield(cursor: string): () => void {
-  const el = document.createElement('div')
-  el.style.cssText = `position:fixed;inset:0;z-index:9999;cursor:${cursor}`
-  document.body.appendChild(el)
-  return () => el.remove()
-}
-
-/**
- * Draggable vertical divider. `onResize` receives the incremental pointer
- * delta (px) since the last move; the parent clamps and applies it.
- */
-function ResizeHandle({ onResize }: { onResize: (dx: number) => void }): React.JSX.Element {
-  const onMouseDown = (e: React.MouseEvent): void => {
-    e.preventDefault()
-    let last = e.clientX
-    const removeShield = beginDragShield('col-resize')
-    const move = (ev: MouseEvent): void => {
-      onResize(ev.clientX - last)
-      last = ev.clientX
-    }
-    const up = (): void => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
-      removeShield()
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
-    }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
-    document.body.style.cursor = 'col-resize'
-    document.body.style.userSelect = 'none'
-  }
-  return (
-    <div
-      onMouseDown={onMouseDown}
-      className="w-1 shrink-0 cursor-col-resize bg-zinc-800 transition-colors hover:bg-sky-600"
-    />
-  )
-}
-
-/** Horizontal divider for the stacked preview panels; reports vertical delta. */
-function RowResizeHandle({ onResize }: { onResize: (dy: number) => void }): React.JSX.Element {
-  const onMouseDown = (e: React.MouseEvent): void => {
-    e.preventDefault()
-    let last = e.clientY
-    const removeShield = beginDragShield('row-resize')
-    const move = (ev: MouseEvent): void => {
-      onResize(ev.clientY - last)
-      last = ev.clientY
-    }
-    const up = (): void => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
-      removeShield()
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
-    }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
-    document.body.style.cursor = 'row-resize'
-    document.body.style.userSelect = 'none'
-  }
-  return (
-    <div
-      onMouseDown={onMouseDown}
-      className="h-1 shrink-0 cursor-row-resize bg-zinc-800 transition-colors hover:bg-sky-600"
-    />
-  )
-}
-
-const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v))
-
-/** One row of the compact workspace-bar burger menu; closes the menu on use. */
-function BarMenuItem({
-  children,
-  onClick,
-  close,
-  disabled,
-}: {
-  children: React.ReactNode
-  onClick: () => void
-  close: (open: boolean) => void
-  disabled?: boolean
-}): React.JSX.Element {
-  return (
-    <button
-      onClick={() => {
-        close(false)
-        onClick()
-      }}
-      disabled={disabled}
-      className="block w-full px-3 py-1.5 text-left text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
-    >
-      {children}
-    </button>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Responsive three-pane layout. The file tree and preview are fixed-width side
-// panels; the chat column is the flexible middle. Naively they'd squeeze the
-// chat to nothing on a narrow window. Instead we measure the container and give
-// the chat first claim on MIN_CHAT px; each side panel is shown inline only if
-// it (down to its minimum) still fits in what's left, and otherwise falls back
-// to a floating modal overlay over the chat rather than eating into it.
-// Priority when space runs out: chat > file tree > preview. The tree is small
-// and is primary navigation; the preview is large and transient (reopened by
-// clicking a file), so it's the first to be pushed to an overlay.
-//
-// Overlays respect a strict view hierarchy so an open panel is never buried:
-// the file preview stacks on top of everything until closed, the file browser
-// (tree) is a modal above the chat but below the preview.
-// ---------------------------------------------------------------------------
-
-const MIN_CHAT = 380 // chat keeps at least this many px; panels hide before eating into it
-const TREE_MIN = 160
-const TREE_MAX = 560
-const PREVIEW_MIN = 300
-const HANDLE_W = 4 // ResizeHandle width (w-1) + slack
-
-// 'inline' — a fixed side column that eats into the container.
-// 'overlay' — the panel is open but there's no room to seat it inline, so it
-//   floats as a modal over the chat. Overlays respect a view hierarchy: the
-//   file preview sits on top of everything, the file browser (tree) is a modal
-//   above the chat but below the preview.
-// 'hidden' — the user has the panel closed.
-type PanelMode = 'inline' | 'overlay' | 'hidden'
-type PanelLayout = { mode: PanelMode; width: number }
-
-function computeLayout(
-  cw: number,
-  showTree: boolean,
-  showPreview: boolean,
-  treeW: number,
-  previewW: number,
-): { tree: PanelLayout; preview: PanelLayout } {
-  const tree: PanelLayout = { mode: showTree ? 'overlay' : 'hidden', width: treeW }
-  const preview: PanelLayout = { mode: showPreview ? 'overlay' : 'hidden', width: previewW }
-  // Reserve the chat's minimum up front; panels draw only from what remains.
-  let remaining = cw - MIN_CHAT
-
-  // Tree gets first refusal (small, primary navigation). It may shrink toward
-  // its minimum to fit; below that it falls back to an overlay modal.
-  if (showTree && remaining >= TREE_MIN + HANDLE_W) {
-    tree.mode = 'inline'
-    tree.width = Math.min(treeW, remaining - HANDLE_W)
-    remaining -= tree.width + HANDLE_W
-  }
-  // Preview takes whatever's left, shrinking toward its minimum, else overlays.
-  if (showPreview && remaining >= PREVIEW_MIN + HANDLE_W) {
-    preview.mode = 'inline'
-    preview.width = Math.min(previewW, remaining - HANDLE_W)
-    remaining -= preview.width + HANDLE_W
-  }
-  return { tree, preview }
-}
-
-/** Track an element's live pixel width via ResizeObserver. */
-function useElementWidth<T extends HTMLElement>(): [React.RefObject<T | null>, number] {
-  const ref = useRef<T>(null)
-  const [w, setW] = useState(0)
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) setW(e.contentRect.width)
-    })
-    ro.observe(el)
-    setW(el.getBoundingClientRect().width)
-    return () => ro.disconnect()
-  }, [])
-  return [ref, w]
-}
-
-const readAs = (file: File, how: 'dataURL' | 'text'): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const r = new FileReader()
-    r.onload = () => resolve(r.result as string)
-    r.onerror = () => reject(r.error)
-    if (how === 'dataURL') r.readAsDataURL(file)
-    else r.readAsText(file)
-  })
-
-/**
- * Classify a dropped file. Returns the attachment, or a rejection reason to
- * show the user — silently ignoring a dropped file is the worst outcome.
- */
-async function fileToAttachment(
-  file: File,
-): Promise<{ ok: Attachment } | { reject: string }> {
-  if (file.type.startsWith('image/')) {
-    if (file.size > MAX_IMAGE_BYTES) return { reject: `${file.name}: image over 8MB` }
-    const dataUrl = await readAs(file, 'dataURL')
-    return { ok: { kind: 'image', mime: file.type, dataB64: dataUrl.slice(dataUrl.indexOf(',') + 1) } }
-  }
-  if (file.size > MAX_FILE_BYTES) {
-    return { reject: `${file.name}: over 2MB — ask the agent to read it instead` }
-  }
-  const text = await readAs(file, 'text')
-  // A NUL byte or a pile of replacement chars means we decoded binary as
-  // text; inlining that is noise the model pays tokens for.
-  const sample = text.slice(0, 4096)
-  if (sample.includes("\u0000") || (sample.match(/\uFFFD/g)?.length ?? 0) > 8) {
-    return { reject: `${file.name}: looks binary — only text files can be attached` }
-  }
-  return {
-    ok: {
-      kind: 'file',
-      name: file.name,
-      path: window.codehamr.getFilePath(file),
-      text: text.slice(0, MAX_INLINE_CHARS),
-      truncated: text.length > MAX_INLINE_CHARS,
-    },
-  }
-}
-
-/** Render file attachments as fenced blocks appended to the prompt. */
-function inlineFiles(text: string, files: FileAttachment[]): string {
-  if (files.length === 0) return text
-  const blocks = files.map((f) => {
-    const header = f.path ? `${f.name} (${f.path})` : f.name
-    const note = f.truncated ? ' — TRUNCATED, read the file for the rest' : ''
-    return `--- Attached file: ${header}${note} ---\n\`\`\`\n${f.text}\n\`\`\``
-  })
-  return [text, ...blocks].filter(Boolean).join('\n\n')
-}
+import { StatusBar, ContextMeter, VisionHint } from './components/StatusBar'
+import { TranscriptItem } from './components/TranscriptItem'
+import { ToolGroupCard } from './components/ToolCard'
+import { Markdown } from './components/Markdown'
+import { ResizeHandle, RowResizeHandle, BarMenuItem } from './components/ResizeHandle'
+import { SearchModal, HistoryModal } from './components/Modals'
+import type { Attachment, ImageAttachment, FileAttachment, Item, ToolItem, Phase, SlashCmd, ChatEntry } from './workspace/types'
+import { uid, reseatIds, SLASH_COMMANDS, MAX_ATTACHMENTS } from './workspace/types'
+import { basename, clamp, normPath, isAbsPath, toolLabel, fileToAttachment, inlineFiles } from './workspace/helpers'
+import { useElementWidth } from './workspace/hooks'
+import { useGitStatus } from './workspace/useGitStatus'
+import { usePreviewPanels } from './workspace/usePreviewPanels'
+import { TREE_MIN, TREE_MAX, PREVIEW_MIN } from './workspace/layout'
 
 /**
  * Workspace: one open project — its agent session, transcript, file tree and
@@ -403,16 +39,12 @@ export default function Workspace({
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [dragOver, setDragOver] = useState(false)
   const dragDepth = useRef(0)
-  const [showFiles, setShowFiles] = useState(true)
-  const [treeWidth, setTreeWidth] = usePanelWidth('tree', 224)
-  const [previewWidth, setPreviewWidth] = usePanelWidth('preview', 480)
   // Targeted tree reload: which directories to re-fetch (only loaded ones are
   // acted on). nonce makes each signal distinct even if the dirs repeat.
   const [treeReload, setTreeReload] = useState<{ dirs: string[]; nonce: number } | null>(null)
   const reloadDirs = useCallback((dirs: string[]) => {
     setTreeReload((prev) => ({ dirs, nonce: (prev?.nonce ?? 0) + 1 }))
   }, [])
-  const [viewer, setViewer] = useState<Preview | null>(null)
   const [lastInference, setLastInference] = useState<{
     promptTokens: number
     completionTokens: number
@@ -423,76 +55,44 @@ export default function Workspace({
   // in refs, so the readout doesn't cost a re-render per token.
   const genStartRef = useRef<number | null>(null)
   const lastGenMsRef = useRef<number | null>(null)
-  // Mirror the open file's path in a ref so the fs-change effect can re-read it
-  // without depending on `viewer` (which would resubscribe on every open).
-  const viewerPathRef = useRef<string | null>(null)
-  viewerPathRef.current = viewer?.path ?? null
-  const [browserOpen, setBrowserOpen] = useState(false)
-  // The preview slot stacks the file viewer and the live browser vertically.
-  // panelOrder records open order: [0] on top, closing one gives the other the
-  // full height. An adjustable row divider sets the split (each panel min 160px).
-  const [panelOrder, setPanelOrder] = useState<PreviewPanel[]>([])
-  const openPanel = useCallback((p: PreviewPanel) => {
-    setPanelOrder((o) => (o.includes(p) ? o : [...o, p]))
-  }, [])
-  const closeViewer = useCallback(() => {
-    setViewer(null)
-    setPanelOrder((o) => o.filter((x) => x !== 'file'))
-  }, [])
-  const closeBrowser = useCallback(() => {
-    setBrowserOpen(false)
-    setPanelOrder((o) => o.filter((x) => x !== 'browser'))
-  }, [])
-  const previewSlotRef = useRef<HTMLDivElement>(null)
-  const [splitRatio, setSplitRatio] = useState(() => {
-    const s = Number(localStorage.getItem('chpreviewsplit'))
-    return Number.isFinite(s) && s > 0.1 && s < 0.9 ? s : 0.5
-  })
-  const adjustSplit = useCallback((dy: number) => {
-    setSplitRatio((prev) => {
-      const h = previewSlotRef.current?.clientHeight ?? 600
-      const min = 160 / h
-      const next = clamp(prev + dy / h, min, 1 - min)
-      localStorage.setItem('chpreviewsplit', String(next))
-      return next
-    })
-  }, [])
-  // Agent-driven navigation for the browser pane (preview_url tool).
-  const [browserNav, setBrowserNav] = useState<{ url: string; nonce: number } | null>(null)
-  // Pending agent preview request from the event stream (see the effect below).
-  const [agentPreview, setAgentPreview] = useState<{
-    path?: string
-    url?: string
-    nonce: number
-  } | null>(null)
-  const previewInUse = panelOrder.length > 0
-  const [mainRef, mainW] = useElementWidth<HTMLDivElement>()
-  // Default to a wide value until measured so the first paint is inline (the
-  // common case) rather than flashing the overlay drawers.
-  const layout = useMemo(
-    () => computeLayout(mainW || 99999, showFiles, previewInUse, treeWidth, previewWidth),
-    [mainW, showFiles, previewInUse, treeWidth, previewWidth],
+  /** Resolve a tool-arg path (usually workspace-relative) to absolute. */
+  const toAbs = useCallback(
+    (p: string): string => (isAbsPath(p) ? p : `${cwd}/${p}`),
+    [cwd],
   )
+  // Responsive layout + stacked preview slot (file viewer + live browser).
+  const {
+    showFiles,
+    setShowFiles,
+    setTreeWidth,
+    setPreviewWidth,
+    viewer,
+    browserOpen,
+    setBrowserOpen,
+    panelOrder,
+    openPanel,
+    closeViewer,
+    closeBrowser,
+    previewSlotRef,
+    splitRatio,
+    adjustSplit,
+    browserNav,
+    requestAgentPreview,
+    previewInUse,
+    mainRef,
+    layout,
+    openFile,
+  } = usePreviewPanels(cwd, toAbs)
   const [items, setItems] = useState<Item[]>([])
 
-  // Current git branch, shown next to the diff badge. null while unknown / not
-  // a git repo → hidden. Refreshed alongside the diff stat (a checkout changes
-  // both), see refreshGitStat.
-  const [currentBranch, setCurrentBranch] = useState<string | null>(null)
-  // Working-tree git diff stat, shown in the bar. Fetched from the main process
-  // (real `git diff --numstat`) and refreshed on mount, on filesystem changes,
-  // and when a turn ends. null while unknown / not a git repo → badge hidden.
-  const [diffStats, setDiffStats] = useState<{ added: number; removed: number } | null>(null)
-  const gitTimer = useRef<number | undefined>(undefined)
-  const refreshGitStat = useCallback(() => {
-    window.clearTimeout(gitTimer.current)
-    gitTimer.current = window.setTimeout(() => {
-      void window.codehamr.gitDiffStat(cwd).then(setDiffStats)
-      void window.codehamr.gitBranch(cwd).then(setCurrentBranch)
-    }, 250)
-  }, [cwd])
+  // Git branch + working-tree diff stat for the bar, refreshed on mount, on
+  // filesystem changes, and when a turn ends (the agent just edited files).
+  const { currentBranch, diffStats, changedPaths, refreshGitStat } = useGitStatus(cwd)
   const [input, setInput] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  // Markdown preview of the draft: render the composer text so lists, code
+  // blocks etc. are easy to eyeball before sending. Off while empty.
+  const [mdPreview, setMdPreview] = useState(false)
   // Slash-command palette: highlighted row, and a dismissed flag so Escape can
   // hide the popover without clearing what the user typed.
   const [slashSel, setSlashSel] = useState(0)
@@ -612,7 +212,7 @@ export default function Workspace({
         case 'file_diff': {
           // Reload just the edited file's directory (the watcher also catches
           // it, but this is instant).
-          const abs = /^([a-zA-Z]:[\\/]|\/)/.test(event.path) ? event.path : `${cwd}/${event.path}`
+          const abs = isAbsPath(event.path) ? event.path : `${cwd}/${event.path}`
           reloadDirs([abs.replace(/[\\/][^\\/]*$/, '')])
           setItems((prev) =>
             prev.map((it) =>
@@ -624,13 +224,9 @@ export default function Workspace({
           break
         }
         case 'preview':
-          // Agent-requested preview (preview_file / preview_url tools); a
-          // later effect opens the panel — openFile isn't defined yet here.
-          setAgentPreview((prev) => ({
-            path: event.path,
-            url: event.url,
-            nonce: (prev?.nonce ?? 0) + 1,
-          }))
+          // Agent-requested preview (preview_file / preview_url tools); the
+          // preview hook opens the panel in a follow-up effect.
+          requestAgentPreview(event.path, event.url)
           break
         case 'reasoning_delta':
           setPhase('thinking')
@@ -741,7 +337,7 @@ export default function Workspace({
           break
       }
     },
-    [endTurn, push, showToast, reloadDirs, cwd],
+    [endTurn, push, showToast, reloadDirs, requestAgentPreview, cwd],
   )
 
   // Subscribe to this workspace's slice of the event streams.
@@ -835,10 +431,7 @@ export default function Workspace({
       const saved = (await window.codehamr.readTranscript(cwd)) as Item[] | null
       if (Array.isArray(saved)) {
         // Reseat the id counter past restored ids so new items can't collide.
-        for (const it of saved) {
-          const n = Number(String(it.id).slice(1))
-          if (Number.isFinite(n) && n >= nextId) nextId = n + 1
-        }
+        reseatIds(saved)
         setItems(saved.map((it) => ('streaming' in it ? { ...it, streaming: false } : it)))
       }
       loadedRef.current = true
@@ -866,12 +459,6 @@ export default function Workspace({
   // Chat history: New chat archives the current conversation; History
   // switches between archived ones (agent restarts with that session).
   // ---------------------------------------------------------------------
-  interface ChatEntry {
-    id: string
-    title: string
-    updatedAt: number
-    current: boolean
-  }
   const [chats, setChats] = useState<ChatEntry[]>([])
   const [historyOpen, setHistoryOpen] = useState(false)
 
@@ -887,10 +474,7 @@ export default function Workspace({
   const loadTranscriptFromDisk = async (): Promise<void> => {
     const saved = (await window.codehamr.readTranscript(cwd)) as Item[] | null
     if (Array.isArray(saved)) {
-      for (const it of saved) {
-        const n = Number(String(it.id).slice(1))
-        if (Number.isFinite(n) && n >= nextId) nextId = n + 1
-      }
+      reseatIds(saved)
       setItems(saved.map((it) => ('streaming' in it ? { ...it, streaming: false } : it)))
     } else {
       setItems([])
@@ -936,15 +520,6 @@ export default function Workspace({
     await loadChats()
   }
 
-  /** Normalize a path for cross-item comparison (win/mac slashes, case). */
-  const normPath = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
-
-  /** Resolve a tool-arg path (usually workspace-relative) to absolute. */
-  const toAbs = useCallback(
-    (p: string): string => (/^([a-zA-Z]:[\\/]|\/)/.test(p) ? p : `${cwd}/${p}`),
-    [cwd],
-  )
-
   // Files the agent wrote/edited this session — emerald dots in the tree.
   const touched = useMemo(() => {
     const set = new Set<string>()
@@ -960,76 +535,6 @@ export default function Workspace({
     }
     return set
   }, [items, toAbs])
-
-  // Read an absolute path into the viewer. Shared by openFile and the live
-  // fs-refresh, so re-reading on a disk change doesn't re-stack the panel.
-  const loadViewer = useCallback(
-    async (abs: string): Promise<void> => {
-      let r: Awaited<ReturnType<typeof window.codehamr.readPreview>>
-      try {
-        r = await window.codehamr.readPreview(cwd, abs)
-      } catch {
-        return // file vanished (deleted/renamed) between the change and the read
-      }
-      switch (r.kind) {
-        case 'text':
-        case 'markdown':
-          setViewer({ kind: r.kind, path: abs, content: r.content, note: r.truncated ? 'truncated view' : null })
-          break
-        case 'image':
-          setViewer({ kind: 'image', path: abs, mime: r.mime, dataB64: r.dataB64 })
-          break
-        case 'pdf':
-        case 'docx':
-          setViewer({ kind: r.kind, path: abs, dataB64: r.dataB64 })
-          break
-        case 'binary':
-          setViewer({ kind: 'unsupported', path: abs, note: 'no preview for this file type' })
-          break
-        case 'too-large':
-          setViewer({ kind: 'unsupported', path: abs, note: `too large to preview (${Math.round(r.size / 1024)}KB)` })
-          break
-      }
-    },
-    [cwd],
-  )
-
-  const openFile = useCallback(
-    async (path: string): Promise<void> => {
-      openPanel('file') // stacks alongside the browser rather than replacing it
-      await loadViewer(toAbs(path))
-    },
-    [loadViewer, toAbs, openPanel],
-  )
-
-  // Live-refresh the open file preview when its directory changes on disk
-  // (agent writes or external edits). The watcher already debounces (300ms) and
-  // reports absolute dirs; re-read only when the open file's own dir is among
-  // them, so unrelated changes don't reload the viewer.
-  useEffect(() => {
-    return window.codehamr.onFsChanged(({ cwd: changedCwd, dirs }) => {
-      if (changedCwd !== cwd || !dirs.length) return
-      const vp = viewerPathRef.current
-      if (!vp) return
-      const n = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
-      const vdir = n(vp).replace(/\/[^/]*$/, '')
-      if (dirs.some((d) => n(d) === vdir)) void loadViewer(vp)
-    })
-  }, [cwd, loadViewer])
-
-  // React to agent preview requests (preview_file / preview_url tools). File
-  // and browser now stack rather than replace, so opening one keeps the other.
-  useEffect(() => {
-    if (!agentPreview) return
-    if (agentPreview.url) {
-      setBrowserNav({ url: agentPreview.url, nonce: agentPreview.nonce })
-      setBrowserOpen(true)
-      openPanel('browser')
-    } else if (agentPreview.path) {
-      void openFile(agentPreview.path)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentPreview])
 
   const addFiles = async (files: Iterable<File>): Promise<void> => {
     const results = await Promise.all([...files].map(fileToAttachment))
@@ -1175,6 +680,7 @@ export default function Workspace({
     const atts = attachments
     setInput('')
     setAttachments([])
+    setMdPreview(false)
     // Mid-turn: queue instead of rejecting — it dispatches when the turn ends.
     if (busy) {
       setQueue((q) => [...q, { text, images: atts }])
@@ -1792,6 +1298,7 @@ export default function Workspace({
               <FileTree
                 root={cwd}
                 touched={touched}
+                changed={changedPaths}
                 reload={treeReload}
                 onOpen={(p) => void openFile(p)}
               />
@@ -1822,6 +1329,7 @@ export default function Workspace({
                 <FileTree
                   root={cwd}
                   touched={touched}
+                  changed={changedPaths}
                   reload={treeReload}
                   onOpen={(p) => void openFile(p)}
                 />
@@ -2083,10 +1591,22 @@ export default function Workspace({
                   ))}
                 </div>
               )}
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => {
+              {mdPreview && input.trim() ? (
+                <div
+                  onClick={() => {
+                    setMdPreview(false)
+                    inputRef.current?.focus()
+                  }}
+                  title="click to edit"
+                  className="max-h-[260px] min-h-[52px] flex-1 cursor-text overflow-y-auto rounded border border-zinc-700 bg-zinc-900 px-3 py-2"
+                >
+                  <Markdown text={input} />
+                </div>
+              ) : (
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => {
                   setInput(e.target.value)
                   setSlashSel(0)
                   setSlashClosed(false)
@@ -2158,6 +1678,28 @@ export default function Workspace({
                 disabled={!connected}
                 className="max-h-[260px] flex-1 resize-none overflow-y-auto rounded border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm outline-none focus:border-zinc-500 disabled:opacity-50"
               />
+              )}
+              <button
+                onClick={() => setMdPreview((p) => !p)}
+                disabled={!input.trim()}
+                title={mdPreview ? 'edit the message' : 'preview as markdown'}
+                className={`flex items-center justify-center rounded px-2.5 disabled:opacity-30 ${
+                  mdPreview ? 'bg-zinc-700 text-sky-400' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
+                }`}
+              >
+                {mdPreview ? (
+                  // editing pencil
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                  </svg>
+                ) : (
+                  // markdown mark
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="5" width="18" height="14" rx="2" />
+                    <path d="M7 15V9l3 3 3-3v6M17.5 9v6M15 12.5l2.5 2.5 2.5-2.5" />
+                  </svg>
+                )}
+              </button>
               <button
                 onClick={() => void sendPrompt()}
                 disabled={!connected || (input.trim() === '' && attachments.length === 0)}
@@ -2225,124 +1767,23 @@ export default function Workspace({
       {showAppearance && <AppearanceModal onClose={() => setShowAppearance(false)} />}
 
       {searchOpen && (
-        <div
-          className="fixed inset-0 z-40 flex items-start justify-center bg-black/50 pt-24"
-          onClick={() => setSearchOpen(false)}
-        >
-          <div
-            className="w-[560px] max-w-[90vw] overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <input
-              autoFocus
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && searchResults.length > 0) {
-                  jumpToMessage(searchResults[0].id)
-                }
-              }}
-              placeholder="search chat messages… (Enter jumps to the first match)"
-              className="w-full border-b border-zinc-800 bg-transparent px-4 py-3 text-sm outline-none"
-            />
-            <div className="max-h-80 overflow-y-auto py-1">
-              {searchResults.map((m) => {
-                const idx = m.text.toLowerCase().indexOf(trimmedQuery)
-                const from = Math.max(0, idx - 40)
-                const snippet =
-                  (from > 0 ? '…' : '') + m.text.slice(from, from + 160).replace(/\s+/g, ' ')
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => jumpToMessage(m.id)}
-                    className="flex w-full items-start gap-2 px-4 py-2 text-left text-xs hover:bg-zinc-800"
-                  >
-                    <span
-                      className={`w-10 shrink-0 pt-0.5 text-[10px] ${
-                        m.kind === 'user' ? 'text-emerald-400' : 'text-zinc-500'
-                      }`}
-                    >
-                      {m.kind === 'user' ? 'you' : 'agent'}
-                    </span>
-                    <span className="line-clamp-2 text-zinc-300">{snippet}</span>
-                  </button>
-                )
-              })}
-              {trimmedQuery && searchResults.length === 0 && (
-                <p className="px-4 py-3 text-xs text-zinc-500">no messages match</p>
-              )}
-              {!trimmedQuery && (
-                <p className="px-4 py-3 text-xs text-zinc-600">
-                  type to search this chat — click a result to jump to it
-                </p>
-              )}
-            </div>
-          </div>
-        </div>
+        <SearchModal
+          query={query}
+          onQuery={setQuery}
+          results={searchResults}
+          trimmedQuery={trimmedQuery}
+          onJump={jumpToMessage}
+          onClose={() => setSearchOpen(false)}
+        />
       )}
 
       {historyOpen && (
-        <div
-          className="fixed inset-0 z-40 flex items-start justify-center bg-black/50 pt-24"
-          onClick={() => setHistoryOpen(false)}
-        >
-          <div
-            className="w-[560px] max-w-[90vw] overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
-              <span className="text-sm font-medium text-zinc-200">Chat history</span>
-              <button
-                onClick={() => setHistoryOpen(false)}
-                title="close"
-                className="rounded px-1 text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="max-h-[60vh] overflow-y-auto py-1">
-              {chats.map((c) => (
-                <div
-                  key={c.id}
-                  className={`group flex items-center gap-2 px-4 py-2 text-sm ${
-                    c.current ? 'text-emerald-300' : 'text-zinc-300 hover:bg-zinc-800'
-                  }`}
-                >
-                  <button
-                    onClick={() => void switchToChat(c.id)}
-                    disabled={c.current}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                  >
-                    <span className="truncate">{c.title}</span>
-                    {c.current && (
-                      <span className="shrink-0 text-[10px] text-emerald-500">· active</span>
-                    )}
-                    <span className="ml-auto shrink-0 text-[10px] text-zinc-500">
-                      {new Date(c.updatedAt).toLocaleString(undefined, {
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                    </span>
-                  </button>
-                  {!c.current && (
-                    <button
-                      onClick={() => void removeChat(c.id)}
-                      title="delete this chat permanently"
-                      className="shrink-0 rounded px-1 text-zinc-600 opacity-0 group-hover:opacity-100 hover:bg-red-950 hover:text-red-400"
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-              ))}
-              {chats.length === 0 && (
-                <p className="px-4 py-3 text-xs text-zinc-500">no chats yet</p>
-              )}
-            </div>
-          </div>
-        </div>
+        <HistoryModal
+          chats={chats}
+          onSwitch={(id) => void switchToChat(id)}
+          onDelete={(id) => void removeChat(id)}
+          onClose={() => setHistoryOpen(false)}
+        />
       )}
 
       {msgMenu && (
@@ -2416,684 +1857,6 @@ export default function Workspace({
           </div>
         </div>
       )}
-    </div>
-  )
-}
-
-/**
- * VisionHint sits beside queued attachments and names the model they'll be
- * sent to. Capability can't be detected reliably across arbitrary endpoints,
- * so this is a soft heuristic: warn-toned when the model name doesn't look
- * multimodal (some servers silently IGNORE image parts on text-only models —
- * no error ever arrives, so this hint is the only clue the user gets).
- */
-function VisionHint({
-  models,
-  activeModel,
-}: {
-  models: ModelProfile[]
-  activeModel: string
-}): React.JSX.Element | null {
-  const llm = models.find((m) => m.name === activeModel)?.llm ?? ''
-  if (!llm) return null
-  const looksVision = /vl|vision|llava|gemma3|4o|pixtral|multimodal/i.test(llm)
-  return (
-    <span className={`pb-0.5 text-[11px] ${looksVision ? 'text-zinc-500' : 'text-amber-400'}`}>
-      {looksVision
-        ? `image will be sent to ${llm}`
-        : `heads-up: "${llm}" doesn't look like a vision model — it may ignore or reject the image`}
-    </span>
-  )
-}
-
-/**
- * ContextMeter shows how full the active model's context window is, using the
- * prompt-token count of the last turn (what the agent actually packed and
- * sent) against the effective window. The denominator is the agent-reported
- * contextWindow when available (covers server-managed profiles whose config
- * omits context_size), else the profile's configured contextSize. A thin bar
- * plus a percentage; it warns-tones as the window fills so a compact/clear is
- * an obvious next move before the agent starts trimming history.
- */
-function ContextMeter({
-  models,
-  activeModel,
-  promptTokens,
-  contextWindow,
-}: {
-  models: ModelProfile[]
-  activeModel: string
-  promptTokens: number
-  contextWindow: number
-}): React.JSX.Element | null {
-  const denom = contextWindow || (models.find((m) => m.name === activeModel)?.contextSize ?? 0)
-  if (!denom) return null
-  const ratio = Math.min(Math.max(promptTokens, 0) / denom, 1)
-  const pct = Math.round(ratio * 100)
-  const tone =
-    ratio >= 0.9 ? 'text-red-400' : ratio >= 0.75 ? 'text-amber-400' : 'text-zinc-500'
-  const barColor =
-    ratio >= 0.9 ? 'bg-red-500' : ratio >= 0.75 ? 'bg-amber-500' : 'bg-zinc-500'
-  return (
-    <div
-      className={`flex items-center gap-1.5 font-mono text-[10px] ${tone}`}
-      title={`context window — ${promptTokens.toLocaleString()} of ${denom.toLocaleString()} tokens (${pct}%) ${
-        promptTokens > 0 ? 'used by the last prompt' : 'used'
-      }`}
-    >
-      <div className="h-1.5 w-10 overflow-hidden rounded-full bg-zinc-800">
-        <div className={`h-full ${barColor}`} style={{ width: `${Math.max(pct, 2)}%` }} />
-      </div>
-      <span>{pct}%</span>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Status bar: continuous proof of life during silent phases.
-// ---------------------------------------------------------------------------
-
-const phaseText: Record<Phase | 'approval', string> = {
-  idle: '',
-  waiting: 'waiting for the model — local models can be silent for a while during prefill',
-  thinking: 'model is thinking',
-  streaming: 'responding',
-  tool: 'running tool',
-  approval: 'waiting for your approval on the tool call above',
-}
-
-function StatusBar({
-  phase,
-  tool,
-  elapsed,
-  step,
-  streamMeter,
-  prefillMs,
-  onCancel,
-}: {
-  phase: Phase | 'approval'
-  tool: string
-  elapsed: number
-  step: number
-  streamMeter: { tokens: number; tokPerSec: number } | null
-  prefillMs: number | null
-  onCancel: () => void
-}): React.JSX.Element {
-  const clock = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`
-  const num = (n: number): string => n.toLocaleString()
-
-  let label: string
-  if (phase === 'tool') {
-    // Contextual tool line, e.g. "reading api.ts" / "running: npm test".
-    label = tool || 'running tool'
-  } else if (phase === 'streaming') {
-    // Prefill/gen split + live generation meter.
-    const parts: string[] = []
-    if (prefillMs != null) parts.push(`prefill ${(prefillMs / 1000).toFixed(1)}s ·`)
-    parts.push('generating')
-    if (streamMeter && streamMeter.tokens > 0) {
-      parts.push(`· ~${num(streamMeter.tokens)} tok`)
-      if (streamMeter.tokPerSec > 0) parts.push(`· ~${num(streamMeter.tokPerSec)} tok/s`)
-    }
-    label = parts.join(' ')
-  } else if (phase === 'waiting') {
-    // Reassurance escalation once a silent local model has run a while.
-    label =
-      elapsed >= 20
-        ? 'still working — large prompts can take a while on local models; Cancel anytime'
-        : 'waiting for the model — local models can be silent during prefill'
-  } else {
-    label = phaseText[phase]
-  }
-
-  // Step badge for multi-round agentic turns (hidden for a simple single reply).
-  const showStep = step >= 1 && (phase === 'tool' || step >= 2)
-
-  return (
-    <div className="flex items-center gap-2 border-t border-zinc-800 bg-zinc-900/70 px-4 py-1.5 text-xs text-zinc-400">
-      <span
-        className={`h-2 w-2 shrink-0 animate-pulse rounded-full ${
-          phase === 'approval' ? 'bg-amber-400' : 'bg-emerald-500'
-        }`}
-      />
-      {showStep && (
-        <span className="shrink-0 rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] tabular-nums text-zinc-300">
-          step {step}
-        </span>
-      )}
-      <span className="truncate">{label}</span>
-      <span className="ml-auto shrink-0 tabular-nums">{clock}</span>
-      <button
-        onClick={onCancel}
-        className="shrink-0 rounded bg-zinc-800 px-2 py-0.5 text-zinc-300 hover:bg-zinc-700"
-      >
-        Cancel
-      </button>
-    </div>
-  )
-}
-
-type Decide = (callId: string, decision: 'allow' | 'deny', scope?: 'session') => void
-
-function TranscriptItem({
-  item,
-  onDecide,
-  onOpenFile,
-  cwd,
-}: {
-  item: Item
-  onDecide: Decide
-  onOpenFile: (path: string) => void
-  cwd?: string
-}): React.JSX.Element {
-  switch (item.kind) {
-    case 'user':
-      return (
-        <div className="ml-auto w-fit max-w-[var(--msg-max,85%)] rounded-lg bg-emerald-900/40 px-3 py-2 text-sm">
-          {item.images && item.images.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {item.images.map((src, i) => (
-                <img key={i} src={src} className="max-h-40 rounded border border-emerald-800/50" />
-              ))}
-            </div>
-          )}
-          {item.files && item.files.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1">
-              {item.files.map((name, i) => (
-                <span
-                  key={i}
-                  className="rounded bg-emerald-950/60 px-1.5 py-0.5 font-mono text-[11px] text-emerald-300"
-                >
-                  📄 {name}
-                </span>
-              ))}
-            </div>
-          )}
-          {item.text && <Markdown text={item.text} />}
-        </div>
-      )
-    case 'assistant':
-      return (
-        <div className="w-fit max-w-[var(--msg-max,85%)] rounded-lg bg-zinc-900 px-3 py-2 text-sm">
-          <Markdown text={item.text} />
-          {item.streaming && <span className="animate-pulse text-zinc-500"> ▍</span>}
-        </div>
-      )
-    case 'reasoning':
-      return <ReasoningCard item={item} />
-    case 'tool':
-      return <ToolCard item={item} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} />
-    case 'notice':
-      return (
-        <div
-          className={`rounded px-3 py-1.5 text-xs ${
-            item.tone === 'error' ? 'bg-red-950 text-red-300' : 'bg-zinc-900 text-zinc-400'
-          }`}
-        >
-          {item.text}
-        </div>
-      )
-  }
-}
-
-/**
- * ReasoningCard: live-streams chain-of-thought while thinking, collapses to a
- * one-line summary once answer tokens start. Click to re-open.
- */
-function ReasoningCard({
-  item,
-}: {
-  item: Extract<Item, { kind: 'reasoning' }>
-}): React.JSX.Element {
-  const [open, setOpen] = useState(false)
-  const expanded = item.streaming || open
-  return (
-    <div className="max-w-[var(--msg-max,85%)] rounded-lg border border-zinc-800/60 bg-zinc-900/40 text-xs text-zinc-500">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
-      >
-        <span className={item.streaming ? 'animate-pulse text-violet-400' : 'text-violet-500/70'}>
-          {item.streaming ? '◈ thinking…' : '◈ thought'}
-        </span>
-        {!expanded && <span className="truncate">{item.text.slice(0, 120)}</span>}
-      </button>
-      {expanded && (
-        <div className="max-h-48 overflow-y-auto border-t border-zinc-800/60 px-3 py-2 whitespace-pre-wrap">
-          {item.text}
-          {item.streaming && <span className="animate-pulse"> ▍</span>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-const statusLabel: Record<ToolStatus, string> = {
-  pending_approval: 'needs approval',
-  running: 'running…',
-  done: 'done',
-  failed: 'failed',
-  denied: 'denied',
-}
-
-/**
- * Per-tool accent color for the name label, so the eye can triage a transcript
- * at a glance: amber = shell, sky = read-only inspection, emerald = file
- * mutations, violet = planning. Full literal classes so Tailwind's JIT keeps
- * them.
- */
-const toolColor: Record<string, string> = {
-  bash: 'text-amber-400',
-  read_file: 'text-sky-400',
-  grep: 'text-sky-400',
-  glob: 'text-sky-400',
-  web_fetch: 'text-cyan-400',
-  write_file: 'text-emerald-400',
-  edit_file: 'text-emerald-400',
-  multi_edit: 'text-emerald-400',
-  todo_write: 'text-violet-400',
-  remember: 'text-fuchsia-400',
-}
-
-const toolColorClass = (name: string): string => toolColor[name] ?? 'text-zinc-400'
-
-/**
- * The file-mutation tools. Their diffs are the whole point of a coding
- * harness, so cards for these default to showing their diff — even when
- * grouped, where other tool cards stay collapsed.
- */
-const isFileEditTool = (name: string): boolean =>
-  name === 'write_file' || name === 'edit_file' || name === 'multi_edit'
-
-/**
- * One-line summary shown in a tool card header. Each tool's most telling
- * argument: the command for bash, the pattern for grep/glob, the path for the
- * file tools, the url for web_fetch, an item count for todo_write. Falls back
- * to the raw args so an unknown tool still shows something readable.
- */
-function toolSummary(name: string, args: Record<string, unknown>): string {
-  switch (name) {
-    case 'bash':
-      return String(args.cmd ?? '')
-    case 'grep':
-    case 'glob': {
-      const pattern = String(args.pattern ?? '')
-      const scope = args.path ? ` in ${args.path}` : ''
-      const include = args.include ? ` (${args.include})` : ''
-      return `${pattern}${include}${scope}`
-    }
-    case 'web_fetch':
-      return String(args.url ?? '')
-    case 'multi_edit': {
-      const path = String(args.path ?? '')
-      const n = Array.isArray(args.edits) ? args.edits.length : 0
-      return n ? `${path} (${n} edit${n === 1 ? '' : 's'})` : path
-    }
-    case 'todo_write': {
-      const n = Array.isArray(args.todos) ? args.todos.length : 0
-      return `${n} item${n === 1 ? '' : 's'}`
-    }
-    case 'remember':
-      return String(args.fact ?? '')
-    case 'read_file':
-    case 'write_file':
-    case 'edit_file':
-      return String(args.path ?? '')
-    default:
-      return String(args.path ?? args.url ?? JSON.stringify(args))
-  }
-}
-
-function ToolCard({
-  item,
-  onDecide,
-  onOpenFile,
-  cwd,
-  embedded = false,
-}: {
-  item: Extract<Item, { kind: 'tool' }>
-  onDecide: Decide
-  onOpenFile: (path: string) => void
-  cwd?: string
-  embedded?: boolean
-}): React.JSX.Element {
-  const [open, setOpen] = useState(isFileEditTool(item.name))
-  const summary = toolSummary(item.name, item.args)
-  // Undo state for a remember card: once forgotten, the fact line is stripped
-  // from the out-of-repo memory file and the card reflects it.
-  const [forgotten, setForgotten] = useState(false)
-  const [forgetting, setForgetting] = useState(false)
-
-  return (
-    <div
-      className={`${embedded ? '' : 'max-w-[var(--msg-max,85%)]'} rounded-lg border border-zinc-800 bg-zinc-900/60 text-sm`}
-    >
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left"
-      >
-        <span className={`font-mono text-xs ${toolColorClass(item.name)}`}>{item.name}</span>
-        <span className="truncate font-mono text-xs text-zinc-400">{summary}</span>
-        {item.background && (
-          <span
-            title="a background process is still running after the shell exited"
-            className="shrink-0 rounded bg-sky-950 px-1.5 py-0.5 text-[10px] font-medium text-sky-300"
-          >
-            background
-          </span>
-        )}
-        <span
-          className={`ml-auto shrink-0 text-xs ${
-            item.status === 'failed' || item.status === 'denied'
-              ? 'text-red-400'
-              : item.status === 'done'
-                ? 'text-emerald-400'
-                : 'text-zinc-400'
-          }`}
-        >
-          {statusLabel[item.status]}
-        </span>
-      </button>
-
-      {item.status === 'pending_approval' && (
-        <div className="flex gap-2 border-t border-zinc-800 px-3 py-2">
-          <button
-            onClick={() => onDecide(item.id, 'allow')}
-            className="rounded bg-emerald-700 px-3 py-1 text-xs font-medium hover:bg-emerald-600"
-          >
-            Allow
-          </button>
-          <button
-            onClick={() => onDecide(item.id, 'allow', 'session')}
-            title={`don't ask again for ${item.name} this session`}
-            className="rounded bg-emerald-900 px-3 py-1 text-xs hover:bg-emerald-800"
-          >
-            Always allow {item.name}
-          </button>
-          <button
-            onClick={() => onDecide(item.id, 'deny')}
-            className="ml-auto rounded bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600"
-          >
-            Deny
-          </button>
-        </div>
-      )}
-
-      {open && item.diff && <DiffBlock diff={item.diff} onOpenFile={onOpenFile} />}
-
-      {/* remember: the saved fact is short and worth seeing at a glance, so
-          show it inline (not hidden behind the output toggle) with a note that
-          it persists into future chats. */}
-      {item.name === 'remember' && typeof item.args.fact === 'string' && (
-        <div className="border-t border-zinc-800 px-3 py-2">
-          <div className="flex items-start gap-2">
-            <span
-              className={`mt-0.5 shrink-0 ${forgotten ? 'text-zinc-600' : 'text-fuchsia-400'}`}
-              title={forgotten ? 'removed from project memory' : 'saved to project memory'}
-            >
-              ★
-            </span>
-            <p
-              className={`font-mono text-xs leading-relaxed whitespace-pre-wrap ${
-                forgotten ? 'text-zinc-500 line-through' : 'text-zinc-200'
-              }`}
-            >
-              {String(item.args.fact)}
-            </p>
-          </div>
-          {item.status === 'done' && (
-            <div className="mt-1.5 flex items-center gap-2 pl-6">
-              <p className="text-[10px] text-zinc-500">
-                {forgotten
-                  ? 'removed from project memory'
-                  : 'saved to project memory — loads into every future chat for this project'}
-              </p>
-              {!forgotten && cwd && (
-                <button
-                  disabled={forgetting}
-                  onClick={() => {
-                    setForgetting(true)
-                    void window.codehamr
-                      .forgetMemory(cwd, String(item.args.fact))
-                      .then((ok) => setForgotten(ok))
-                      .finally(() => setForgetting(false))
-                  }}
-                  className="rounded px-1.5 py-0.5 text-[10px] text-fuchsia-300 hover:bg-fuchsia-950/50 disabled:opacity-40"
-                  title="remove this fact from project memory"
-                >
-                  {forgetting ? 'undoing…' : 'Undo'}
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {open && item.output !== undefined && (
-        <pre className="max-h-64 overflow-auto border-t border-zinc-800 px-3 py-2 font-mono text-xs whitespace-pre-wrap text-zinc-300">
-          {item.output}
-        </pre>
-      )}
-    </div>
-  )
-}
-
-/**
- * ToolGroupCard: consecutive tool calls collapse into one summary row —
- * agents often chain many reads/greps back to back and the transcript drowns
- * in cards. Click to reveal the individual calls. Forced open while any call
- * inside still needs approval or is running (Allow/Deny must stay reachable).
- */
-function ToolGroupCard({
-  tools,
-  onDecide,
-  onOpenFile,
-  cwd,
-}: {
-  tools: ToolItem[]
-  onDecide: Decide
-  onOpenFile: (path: string) => void
-  cwd?: string
-}): React.JSX.Element {
-  const [open, setOpen] = useState(false)
-  if (tools.length === 1) {
-    return <ToolCard item={tools[0]} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} />
-  }
-  const active = tools.some((t) => t.status === 'pending_approval' || t.status === 'running')
-  const expanded = open || active
-  const failed = tools.filter((t) => t.status === 'failed' || t.status === 'denied').length
-  const uniqueNames = [...new Set(tools.map((t) => t.name))]
-  const hasBackground = tools.some((t) => t.background)
-  // File edits stay visible even while the group is collapsed — hiding a diff
-  // behind a fold is the wrong default for a coding harness. Each edit card
-  // still toggles its own diff off when tapped.
-  const editTools = tools.filter((t) => isFileEditTool(t.name))
-  const showEditsOnly = !expanded && editTools.length > 0
-  return (
-    <div className="max-w-[var(--msg-max,85%)] rounded-lg border border-zinc-800 bg-zinc-900/40 text-sm">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left"
-      >
-        <span className="text-xs text-zinc-500">{expanded ? '▾' : '▸'}</span>
-        <span className="text-xs text-zinc-300">
-          {tools.length} tool call{tools.length === 1 ? '' : 's'}
-        </span>
-        <span className="flex min-w-0 gap-1.5 truncate font-mono text-xs">
-          {uniqueNames.map((n, i) => (
-            <span key={n} className={toolColorClass(n)}>
-              {n}
-              {i < uniqueNames.length - 1 ? ',' : ''}
-            </span>
-          ))}
-        </span>
-        {hasBackground && (
-          <span
-            title="a background process is still running after the shell exited"
-            className="shrink-0 rounded bg-sky-950 px-1.5 py-0.5 text-[10px] font-medium text-sky-300"
-          >
-            background
-          </span>
-        )}
-        <span
-          className={`ml-auto shrink-0 text-xs ${
-            active ? 'text-zinc-400' : failed > 0 ? 'text-red-400' : 'text-emerald-400'
-          }`}
-        >
-          {active ? 'working…' : failed > 0 ? `${failed} failed` : 'done'}
-        </span>
-      </button>
-      {expanded && (
-        <div className="space-y-2 border-t border-zinc-800 p-2">
-          {tools.map((t) => (
-            <ToolCard key={t.id} item={t} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} embedded />
-          ))}
-        </div>
-      )}
-      {showEditsOnly && (
-        <div className="space-y-2 border-t border-zinc-800 p-2">
-          {editTools.map((t) => (
-            <ToolCard key={t.id} item={t} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} embedded />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/**
- * DiffBlock: colored unified diff, auto-expanded — seeing what the agent
- * changed is the harness's whole point. Long diffs scroll inside the card.
- */
-function DiffBlock({
-  diff,
-  onOpenFile,
-}: {
-  diff: { path: string; unifiedDiff: string }
-  onOpenFile: (path: string) => void
-}): React.JSX.Element {
-  const lines = diff.unifiedDiff.split('\n')
-  return (
-    <div className="border-t border-zinc-800 px-3 pt-1.5 pb-3">
-      <button
-        onClick={() => onOpenFile(diff.path)}
-        title="open this file in the viewer"
-        className="pb-1.5 font-mono text-xs text-sky-400 hover:underline"
-      >
-        {diff.path}
-      </button>
-      {/* Inset, rounded panel on the fixed code palette (dark on dark themes,
-          light on light) — see --code-* / --diff-* in styles.css. */}
-      <pre
-        className="max-h-80 overflow-y-auto rounded-lg border px-3 py-2 font-mono text-xs leading-5 break-words whitespace-pre-wrap"
-        style={{
-          background: 'var(--code-bg)',
-          color: 'var(--code-fg)',
-          borderColor: 'var(--code-border)',
-        }}
-      >
-        {lines.map((line, i) => {
-          let style: React.CSSProperties | undefined
-          if (line.startsWith('+') && !line.startsWith('+++'))
-            style = { background: 'var(--diff-add-bg)', color: 'var(--diff-add-fg)' }
-          else if (line.startsWith('-') && !line.startsWith('---'))
-            style = { background: 'var(--diff-del-bg)', color: 'var(--diff-del-fg)' }
-          else if (line.startsWith('@@')) style = { color: 'var(--diff-hunk-fg)' }
-          else if (line.startsWith('+++') || line.startsWith('---'))
-            style = { color: 'var(--diff-meta-fg)' }
-          return (
-            <div key={i} style={style}>
-              {line || ' '}
-            </div>
-          )
-        })}
-      </pre>
-    </div>
-  )
-}
-
-/** Markdown renderer for assistant bubbles, styled for the dark transcript. */
-// Custom code renderer: syntax-highlight fenced blocks with the shared hljs;
-// leave inline code (no language class) to the CSS styling.
-function MdCode({
-  className,
-  children,
-}: {
-  className?: string
-  children?: React.ReactNode
-}): React.JSX.Element {
-  const lang = /language-(\w+)/.exec(className ?? '')?.[1]
-  const html = lang ? highlight(String(children).replace(/\n$/, ''), lang) : null
-  if (html) {
-    return <code className="hljs !bg-transparent" dangerouslySetInnerHTML={{ __html: html }} />
-  }
-  return <code className={className}>{children}</code>
-}
-
-/** Small clipboard button; flips to "Copied" for a beat after a click. */
-function CopyButton({
-  text,
-  className = '',
-}: {
-  text: string
-  className?: string
-}): React.JSX.Element {
-  const [copied, setCopied] = useState(false)
-  return (
-    <button
-      type="button"
-      onClick={() => {
-        void navigator.clipboard.writeText(text)
-        setCopied(true)
-        window.setTimeout(() => setCopied(false), 1500)
-      }}
-      title="copy to clipboard"
-      className={`rounded border border-zinc-700 bg-zinc-800/80 px-1.5 py-0.5 text-[10px] leading-none text-zinc-300 backdrop-blur transition hover:bg-zinc-700 ${className}`}
-    >
-      {copied ? '✓ Copied' : 'Copy'}
-    </button>
-  )
-}
-
-// Minimal shape of the hast node react-markdown hands to element components —
-// enough to walk it for the block's raw text (the rendered <code> may be
-// highlighted HTML, so the DOM children aren't a reliable source).
-type HastNode = { type?: string; value?: string; children?: HastNode[] }
-const nodeText = (n?: HastNode): string =>
-  !n ? '' : n.type === 'text' ? (n.value ?? '') : (n.children ?? []).map(nodeText).join('')
-
-/**
- * Fenced code block wrapper: adds a hover-reveal Copy button. Overriding `pre`
- * (not `code`) keeps inline code untouched — react-markdown only wraps block
- * code in <pre>.
- */
-function MdPre({
-  children,
-  node,
-}: {
-  children?: React.ReactNode
-  node?: HastNode
-}): React.JSX.Element {
-  const code = nodeText(node).replace(/\n$/, '')
-  return (
-    <div className="group/code relative">
-      <CopyButton
-        text={code}
-        className="absolute top-1.5 right-1.5 opacity-0 group-hover/code:opacity-100"
-      />
-      <pre>{children}</pre>
-    </div>
-  )
-}
-
-const MD_COMPONENTS = { code: MdCode, pre: MdPre }
-
-function Markdown({ text }: { text: string }): React.JSX.Element {
-  return (
-    <div className="space-y-2 text-sm [&_a]:text-sky-400 [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-zinc-700 [&_blockquote]:pl-3 [&_blockquote]:text-zinc-400 [&_code]:rounded [&_code]:bg-zinc-800 [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.85em] [&_h1]:text-base [&_h1]:font-bold [&_h2]:text-sm [&_h2]:font-bold [&_h3]:font-semibold [&_li]:ml-4 [&_ol]:list-decimal [&_pre]:overflow-x-auto [&_pre]:rounded [&_pre]:border [&_pre]:border-[var(--code-border)] [&_pre]:bg-[var(--code-bg)] [&_pre]:p-3 [&_pre]:text-[var(--code-fg)] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:border-collapse [&_td]:border [&_td]:border-zinc-700 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-zinc-700 [&_th]:bg-zinc-800 [&_th]:px-2 [&_th]:py-1 [&_ul]:list-disc">
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={MD_COMPONENTS}>
-        {text}
-      </ReactMarkdown>
     </div>
   )
 }

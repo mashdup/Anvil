@@ -5,6 +5,7 @@ import * as pdfjsLib from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import mammoth from 'mammoth'
 import { EXT_LANG, highlight } from './syntax'
+import { numberDiffLines, gut } from './workspace/diff'
 
 // Bundled worker (no network — the strict CSP forbids external fetches).
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
@@ -44,20 +45,62 @@ export function FilePreview({
       return !w
     })
 
+  // Show the file vs its git diff. Only meaningful for text; the diff string is
+  // fetched lazily (null = unknown/not fetched, '' = no changes → toggle hidden).
+  const [showDiff, setShowDiff] = useState(false)
+  const [diff, setDiff] = useState<string | null>(null)
+  useEffect(() => {
+    setShowDiff(false)
+    if (preview.kind !== 'text') {
+      setDiff('')
+      return
+    }
+    let cancelled = false
+    void window.codehamr
+      .gitFileDiff(workspaceRoot, preview.path)
+      .then((d) => {
+        if (!cancelled) setDiff(d ?? '')
+      })
+      .catch(() => {
+        if (!cancelled) setDiff('')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [preview.kind === 'text' ? preview.path : preview.kind, preview.kind === 'text' ? preview.content : '', workspaceRoot])
+  const hasDiff = preview.kind === 'text' && !!diff
+
   return (
     <div className="flex min-w-0 flex-1 flex-col border-l border-zinc-800">
       <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
-        <span className="truncate font-mono text-xs text-zinc-300" title={preview.path}>
-          {preview.path}
+        <span
+          dir="rtl"
+          className="truncate text-left font-mono text-xs text-zinc-300"
+          title={preview.path}
+        >
+          {/* dir=rtl clips the ellipsis at the START (keeping the filename
+              visible); the bdi keeps the path itself rendering left-to-right. */}
+          <bdi>{preview.path}</bdi>
         </span>
         {'note' in preview && preview.note && (
           <span className="shrink-0 text-[10px] text-amber-400">{preview.note}</span>
         )}
-        {preview.kind === 'text' && (
+        {hasDiff && (
+          <button
+            onClick={() => setShowDiff((s) => !s)}
+            title={showDiff ? 'show the file' : 'show this file’s changes vs git HEAD'}
+            className={`ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium hover:bg-zinc-800 ${
+              showDiff ? 'bg-zinc-800 text-sky-400' : 'text-zinc-400'
+            }`}
+          >
+            {showDiff ? 'File' : 'Diff'}
+          </button>
+        )}
+        {preview.kind === 'text' && !showDiff && (
           <button
             onClick={toggleWrap}
             title={wrap ? 'word wrap on — click to scroll long lines instead' : 'word wrap off'}
-            className={`ml-auto shrink-0 rounded p-1 hover:bg-zinc-800 ${
+            className={`${hasDiff ? '' : 'ml-auto'} shrink-0 rounded p-1 hover:bg-zinc-800 ${
               wrap ? 'text-sky-400' : 'text-zinc-500'
             }`}
           >
@@ -78,7 +121,7 @@ export function FilePreview({
         <button
           onClick={onClose}
           className={`shrink-0 rounded px-1.5 text-zinc-400 hover:bg-zinc-800 ${
-            preview.kind === 'text' ? '' : 'ml-auto'
+            preview.kind === 'text' || hasDiff ? '' : 'ml-auto'
           }`}
         >
           ✕
@@ -92,13 +135,51 @@ export function FilePreview({
           preview.kind === 'text' ? 'bg-[var(--code-bg)] text-[var(--code-fg)]' : ''
         }`}
       >
-        <Body
-          preview={preview}
-          workspaceRoot={workspaceRoot}
-          onUseInPrompt={onUseInPrompt}
-          wrap={wrap}
-        />
+        {showDiff && hasDiff ? (
+          <DiffView diff={diff} />
+        ) : (
+          <Body
+            preview={preview}
+            workspaceRoot={workspaceRoot}
+            onUseInPrompt={onUseInPrompt}
+            wrap={wrap}
+          />
+        )}
       </div>
+    </div>
+  )
+}
+
+/**
+ * DiffView: a colored unified diff (git diff HEAD) for the previewed file,
+ * using the shared --diff-* palette so it tracks light/dark themes and matches
+ * the tool-card diffs. An old·new line-number gutter is derived from the @@
+ * hunk headers. Header/index lines are dimmed; +/- lines are tinted.
+ */
+function DiffView({ diff }: { diff: string }): React.JSX.Element {
+  const rows = numberDiffLines(diff)
+  return (
+    <div className="px-3 py-2 font-mono text-xs leading-5">
+      {rows.map((row, i) => {
+        let style: React.CSSProperties | undefined
+        if (row.kind === 'add')
+          style = { background: 'var(--diff-add-bg)', color: 'var(--diff-add-fg)' }
+        else if (row.kind === 'del')
+          style = { background: 'var(--diff-del-bg)', color: 'var(--diff-del-fg)' }
+        else if (row.kind === 'hunk') style = { color: 'var(--diff-hunk-fg)' }
+        else if (row.kind === 'meta') style = { color: 'var(--diff-meta-fg)' }
+        return (
+          <div key={i} className="flex" style={style}>
+            <span
+              className="shrink-0 pr-2 text-right whitespace-pre select-none tabular-nums"
+              style={{ color: 'var(--code-gutter-fg)' }}
+            >
+              {gut(row.oldNo)} {gut(row.newNo)}
+            </span>
+            <span className="flex-1 break-words whitespace-pre-wrap">{row.text || ' '}</span>
+          </div>
+        )
+      })}
     </div>
   )
 }

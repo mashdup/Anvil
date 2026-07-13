@@ -62,6 +62,14 @@ const api = {
     abs: string,
   ): Promise<{ added: number[]; modified: number[]; removedBefore: number[] } | null> =>
     ipcRenderer.invoke('git:filechanges', cwd, abs),
+  /** Full unified diff of one file vs HEAD, for the preview's Diff view. */
+  gitFileDiff: (cwd: string, abs: string): Promise<string | null> =>
+    ipcRenderer.invoke('git:filediff', cwd, abs),
+  /** Working-tree git changes for the file tree's indicators. Absolute paths. */
+  gitStatus: (
+    cwd: string,
+  ): Promise<{ modified: string[]; added: string[]; untracked: string[] } | null> =>
+    ipcRenderer.invoke('git:status', cwd),
   /** System clipboard, for the composer's right-click menu. */
   readClipboard: (): Promise<string> => ipcRenderer.invoke('clipboard:read'),
   writeClipboard: (text: string): Promise<void> => ipcRenderer.invoke('clipboard:write', text),
