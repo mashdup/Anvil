@@ -4,7 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  * FileTree: a drill-in file browser for the open workspace. Instead of an
  * ever-expanding tree, clicking a folder navigates INTO it (showing just that
  * folder's contents); a breadcrumb bar walks back up. `touched` files get an
- * emerald dot; `reload` re-fetches the current folder when it changes on disk.
+ * emerald dot, and so does any folder with a `touched` file nested anywhere
+ * inside it, so change indicators aren't buried below collapsed folders.
+ * `reload` re-fetches the current folder when it changes on disk.
  *
  * A single directory level is small enough to render directly (capped at CAP
  * rows), so there's no windowing/virtualization — the hand-rolled version left
@@ -100,6 +102,18 @@ export function FileTree({
 
   const shown = entries.slice(0, CAP)
 
+  // A folder shows the change dot when any touched file is nested anywhere
+  // inside it. `touched` holds lowercased, forward-slashed absolute paths;
+  // match by directory prefix so nesting depth doesn't matter.
+  const dirTouched = useCallback(
+    (folderPath: string): boolean => {
+      const prefix = folderPath.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '') + '/'
+      for (const p of touched) if (p.startsWith(prefix)) return true
+      return false
+    },
+    [touched],
+  )
+
   return (
     <div className="flex h-full flex-col font-mono text-xs">
       <div className="flex shrink-0 items-center overflow-x-auto border-b border-zinc-800 px-2 py-1 whitespace-nowrap text-zinc-400">
@@ -135,7 +149,17 @@ export function FileTree({
             >
               <span className="shrink-0 text-amber-500/80">▸</span>
               <span className="truncate">{entry.name}</span>
-              <span className="ml-auto shrink-0 text-zinc-600">›</span>
+              {dirTouched(entry.path) && (
+                <span
+                  className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
+                  title="contains files edited by the agent this session"
+                />
+              )}
+              <span
+                className={`shrink-0 text-zinc-600 ${dirTouched(entry.path) ? 'ml-1' : 'ml-auto'}`}
+              >
+                ›
+              </span>
             </button>
           ) : (
             <button
