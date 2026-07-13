@@ -167,6 +167,20 @@
   color: var(--code-fg);
 }
 
+/* Git change bar in the code gutter (like an editor): a colored strip on the
+   inner edge of the line-number column. Added = green, modified = amber,
+   removed-above = a red wedge on the row below the deletion. Uses the shared
+   --diff-* palette so it tracks light/dark themes. */
+.ch-git-added {
+  box-shadow: inset -3px 0 0 0 var(--diff-add-fg);
+}
+.ch-git-modified {
+  box-shadow: inset -3px 0 0 0 var(--diff-hunk-fg);
+}
+.ch-git-removed {
+  box-shadow: inset -3px 2px 0 -1px var(--diff-del-fg);
+}
+
 /* Light syntax palette (GitHub Light), applied only on light themes; the
    bundled github-dark.css supplies the dark one. */
 :root[data-light] .hljs-doctag,

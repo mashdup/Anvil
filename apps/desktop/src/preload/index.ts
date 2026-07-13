@@ -56,6 +56,12 @@ const api = {
   gitDiffStat: (cwd: string): Promise<{ added: number; removed: number } | null> =>
     ipcRenderer.invoke('git:diffstat', cwd),
   gitBranch: (cwd: string): Promise<string | null> => ipcRenderer.invoke('git:branch', cwd),
+  /** Per-line git change markers for the file viewer's gutter. */
+  gitFileChanges: (
+    cwd: string,
+    abs: string,
+  ): Promise<{ added: number[]; modified: number[]; removedBefore: number[] } | null> =>
+    ipcRenderer.invoke('git:filechanges', cwd, abs),
   /** System clipboard, for the composer's right-click menu. */
   readClipboard: (): Promise<string> => ipcRenderer.invoke('clipboard:read'),
   writeClipboard: (text: string): Promise<void> => ipcRenderer.invoke('clipboard:write', text),

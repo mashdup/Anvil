@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, clipboard } from 'electron'
-import { join, resolve, sep } from 'node:path'
+import { join, resolve, sep, relative, isAbsolute } from 'node:path'
 import {
   existsSync,
   mkdirSync,
@@ -294,6 +294,80 @@ async function gitDiffStat(cwd: string): Promise<{ added: number; removed: numbe
   return { added, removed }
 }
 
+/** A per-line git change marker for the file viewer's gutter. `added` and
+ *  `modified` mark existing lines (1-based, in the working-tree file);
+ *  `removedBefore` lists line numbers that have a deletion immediately above
+ *  them (shown as a wedge between rows, like an editor gutter). */
+export interface GitLineChanges {
+  added: number[]
+  modified: number[]
+  removedBefore: number[]
+}
+
+/**
+ * Per-line change status of one file vs HEAD, for the preview gutter (à la an
+ * editor's change bar). Parses `git diff HEAD -U0` hunk headers: a hunk with no
+ * old lines is an addition, no new lines is a deletion, otherwise a
+ * modification. An untracked (new, non-ignored) file marks every line added.
+ * Returns null when it's not a repo, git is missing, or the file is unchanged /
+ * outside the repo — the UI then shows a plain gutter.
+ */
+async function gitFileChanges(cwd: string, abs: string): Promise<GitLineChanges | null> {
+  const rel = relative(cwd, abs)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null // outside the repo
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  // Untracked new file: every line is an addition.
+  const tracked = await run(['ls-files', '--error-unmatch', '--', rel])
+  if (tracked === null) {
+    const others = await run(['ls-files', '--others', '--exclude-standard', '--', rel])
+    if (others && others.trim()) {
+      try {
+        const buf = await readFile(abs)
+        if (buf.subarray(0, 8192).includes(0)) return null // binary
+        const n = countLines(buf.toString('utf8'))
+        return { added: Array.from({ length: n }, (_, i) => i + 1), modified: [], removedBefore: [] }
+      } catch {
+        return null
+      }
+    }
+    return null // not a repo / git missing / ignored
+  }
+  const out = await run(['diff', 'HEAD', '-U0', '--no-color', '--', rel])
+  if (out === null || out.trim() === '') return null // unchanged (or no diff)
+  const added: number[] = []
+  const modified: number[] = []
+  const removedBefore: number[] = []
+  for (const line of out.split('\n')) {
+    // "@@ -oldStart,oldCount +newStart,newCount @@"; counts default to 1.
+    const m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line)
+    if (!m) continue
+    const oldCount = m[1] === undefined ? 1 : Number(m[1])
+    const newStart = Number(m[2])
+    const newCount = m[3] === undefined ? 1 : Number(m[3])
+    if (newCount === 0) {
+      // Pure deletion: mark the line the removed block sat before.
+      removedBefore.push(newStart + 1)
+    } else if (oldCount === 0) {
+      for (let i = 0; i < newCount; i++) added.push(newStart + i)
+    } else {
+      for (let i = 0; i < newCount; i++) modified.push(newStart + i)
+    }
+  }
+  if (!added.length && !modified.length && !removedBefore.length) return null
+  return { added, modified, removedBefore }
+}
+
 /**
  * Current git branch for the workspace, for the header indicator. Returns the
  * branch name, or the short commit SHA when HEAD is detached, or null when it's
@@ -439,6 +513,9 @@ function wireIpc(): void {
   // removed lines. Returns null when it's not a git repo or git is missing, so
   // the UI can hide the badge.
   ipcMain.handle('git:diffstat', async (_evt, cwd: string) => gitDiffStat(cwd))
+  ipcMain.handle('git:filechanges', async (_evt, cwd: string, abs: string) =>
+    gitFileChanges(cwd, abs),
+  )
   ipcMain.handle('git:branch', async (_evt, cwd: string) => gitBranch(cwd))
 
   // System clipboard access for the composer's right-click menu. Routed

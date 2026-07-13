@@ -211,6 +211,45 @@ function CodeView({
   const lang = EXT_LANG[ext]
   const html = useMemo(() => highlight(content, lang), [content, lang])
 
+  // Per-line git change status vs HEAD, for the gutter change bar (like an
+  // editor). Re-fetched when the file or its content changes (live refresh).
+  const [gitChanges, setGitChanges] = useState<{
+    added: Set<number>
+    modified: Set<number>
+    removedBefore: Set<number>
+  } | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void window.codehamr
+      .gitFileChanges(workspaceRoot, path)
+      .then((c) => {
+        if (cancelled) return
+        setGitChanges(
+          c
+            ? {
+                added: new Set(c.added),
+                modified: new Set(c.modified),
+                removedBefore: new Set(c.removedBefore),
+              }
+            : null,
+        )
+      })
+      .catch(() => {
+        if (!cancelled) setGitChanges(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [path, content, workspaceRoot])
+  // Marker class for a line's gutter, from its git change status.
+  const changeClass = (n: number): string => {
+    if (!gitChanges) return ''
+    if (gitChanges.added.has(n)) return 'ch-git-added'
+    if (gitChanges.modified.has(n)) return 'ch-git-modified'
+    if (gitChanges.removedBefore.has(n)) return 'ch-git-removed'
+    return ''
+  }
+
   const rawLines = useMemo(() => content.split('\n'), [content])
   const interactive = rawLines.length <= LINE_INTERACTIVE_CAP
   const htmlLines = useMemo(
@@ -415,7 +454,7 @@ function CodeView({
                     ? { background: 'var(--code-sel-bg)', color: 'var(--code-sel-fg)' }
                     : { background: 'var(--code-gutter-bg)', color: 'var(--code-gutter-fg)' }
                 }
-                className="sticky left-0 w-12 shrink-0 cursor-pointer border-r border-[var(--code-border)] px-2 text-right select-none"
+                className={`sticky left-0 w-12 shrink-0 cursor-pointer border-r border-[var(--code-border)] px-2 text-right select-none ${changeClass(n)}`}
               >
                 {n}
               </span>
