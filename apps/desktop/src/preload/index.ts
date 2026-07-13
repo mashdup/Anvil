@@ -81,6 +81,16 @@ const api = {
     ipcRenderer.invoke('chats:delete', cwd, id),
   writeTranscript: (cwd: string, items: unknown): Promise<void> =>
     ipcRenderer.invoke('transcript:write', cwd, items),
+  /** Project memory (out-of-repo, per-project): view, edit, download, load. */
+  readMemory: (cwd: string): Promise<{ content: string; path: string }> =>
+    ipcRenderer.invoke('memory:read', cwd),
+  writeMemory: (cwd: string, content: string): Promise<void> =>
+    ipcRenderer.invoke('memory:write', cwd, content),
+  exportMemory: (cwd: string): Promise<string | null> =>
+    ipcRenderer.invoke('memory:export', cwd),
+  importMemory: (): Promise<string | null> => ipcRenderer.invoke('memory:import'),
+  forgetMemory: (cwd: string, fact: string): Promise<boolean> =>
+    ipcRenderer.invoke('memory:forget', cwd, fact),
   startAgent: (cwd: string): Promise<{ running: boolean; seededFrom: string | null }> =>
     ipcRenderer.invoke('agent:start', cwd),
   stopAgent: (cwd: string): Promise<void> => ipcRenderer.invoke('agent:stop', cwd),

@@ -114,6 +114,10 @@ function toolLabel(name: string, args: Record<string, unknown>): string {
     }
     case 'todo_write':
       return 'updating plan'
+    case 'remember': {
+      const f = typeof args.fact === 'string' ? args.fact : ''
+      return f ? `remembering: ${clip(f)}` : 'saving to project memory'
+    }
     case 'preview_file':
       return 'opening preview'
     case 'preview_url':
@@ -1763,6 +1767,7 @@ export default function Workspace({
                   tools={r.tools}
                   onDecide={decide}
                   onOpenFile={(p) => void openFile(p)}
+                  cwd={cwd}
                 />
               ) : (
                 <div
@@ -1799,6 +1804,7 @@ export default function Workspace({
                     item={r.item}
                     onDecide={decide}
                     onOpenFile={(p) => void openFile(p)}
+                    cwd={cwd}
                   />
                 </div>
               ),
@@ -2437,10 +2443,12 @@ function TranscriptItem({
   item,
   onDecide,
   onOpenFile,
+  cwd,
 }: {
   item: Item
   onDecide: Decide
   onOpenFile: (path: string) => void
+  cwd?: string
 }): React.JSX.Element {
   switch (item.kind) {
     case 'user':
@@ -2478,7 +2486,7 @@ function TranscriptItem({
     case 'reasoning':
       return <ReasoningCard item={item} />
     case 'tool':
-      return <ToolCard item={item} onDecide={onDecide} onOpenFile={onOpenFile} />
+      return <ToolCard item={item} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} />
     case 'notice':
       return (
         <div
@@ -2548,6 +2556,7 @@ const toolColor: Record<string, string> = {
   edit_file: 'text-emerald-400',
   multi_edit: 'text-emerald-400',
   todo_write: 'text-violet-400',
+  remember: 'text-fuchsia-400',
 }
 
 const toolColorClass = (name: string): string => toolColor[name] ?? 'text-zinc-400'
@@ -2580,6 +2589,8 @@ function toolSummary(name: string, args: Record<string, unknown>): string {
       const n = Array.isArray(args.todos) ? args.todos.length : 0
       return `${n} item${n === 1 ? '' : 's'}`
     }
+    case 'remember':
+      return String(args.fact ?? '')
     case 'read_file':
     case 'write_file':
     case 'edit_file':
@@ -2593,15 +2604,21 @@ function ToolCard({
   item,
   onDecide,
   onOpenFile,
+  cwd,
   embedded = false,
 }: {
   item: Extract<Item, { kind: 'tool' }>
   onDecide: Decide
   onOpenFile: (path: string) => void
+  cwd?: string
   embedded?: boolean
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const summary = toolSummary(item.name, item.args)
+  // Undo state for a remember card: once forgotten, the fact line is stripped
+  // from the out-of-repo memory file and the card reflects it.
+  const [forgotten, setForgotten] = useState(false)
+  const [forgetting, setForgetting] = useState(false)
 
   return (
     <div
@@ -2660,6 +2677,54 @@ function ToolCard({
 
       {item.diff && <DiffBlock diff={item.diff} onOpenFile={onOpenFile} />}
 
+      {/* remember: the saved fact is short and worth seeing at a glance, so
+          show it inline (not hidden behind the output toggle) with a note that
+          it persists into future chats. */}
+      {item.name === 'remember' && typeof item.args.fact === 'string' && (
+        <div className="border-t border-zinc-800 px-3 py-2">
+          <div className="flex items-start gap-2">
+            <span
+              className={`mt-0.5 shrink-0 ${forgotten ? 'text-zinc-600' : 'text-fuchsia-400'}`}
+              title={forgotten ? 'removed from project memory' : 'saved to project memory'}
+            >
+              ★
+            </span>
+            <p
+              className={`font-mono text-xs leading-relaxed whitespace-pre-wrap ${
+                forgotten ? 'text-zinc-500 line-through' : 'text-zinc-200'
+              }`}
+            >
+              {String(item.args.fact)}
+            </p>
+          </div>
+          {item.status === 'done' && (
+            <div className="mt-1.5 flex items-center gap-2 pl-6">
+              <p className="text-[10px] text-zinc-500">
+                {forgotten
+                  ? 'removed from project memory'
+                  : 'saved to project memory — loads into every future chat for this project'}
+              </p>
+              {!forgotten && cwd && (
+                <button
+                  disabled={forgetting}
+                  onClick={() => {
+                    setForgetting(true)
+                    void window.codehamr
+                      .forgetMemory(cwd, String(item.args.fact))
+                      .then((ok) => setForgotten(ok))
+                      .finally(() => setForgetting(false))
+                  }}
+                  className="rounded px-1.5 py-0.5 text-[10px] text-fuchsia-300 hover:bg-fuchsia-950/50 disabled:opacity-40"
+                  title="remove this fact from project memory"
+                >
+                  {forgetting ? 'undoing…' : 'Undo'}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {open && item.output !== undefined && (
         <pre className="max-h-64 overflow-auto border-t border-zinc-800 px-3 py-2 font-mono text-xs whitespace-pre-wrap text-zinc-300">
           {item.output}
@@ -2679,14 +2744,16 @@ function ToolGroupCard({
   tools,
   onDecide,
   onOpenFile,
+  cwd,
 }: {
   tools: ToolItem[]
   onDecide: Decide
   onOpenFile: (path: string) => void
+  cwd?: string
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   if (tools.length === 1) {
-    return <ToolCard item={tools[0]} onDecide={onDecide} onOpenFile={onOpenFile} />
+    return <ToolCard item={tools[0]} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} />
   }
   const active = tools.some((t) => t.status === 'pending_approval' || t.status === 'running')
   const expanded = open || active
@@ -2730,7 +2797,7 @@ function ToolGroupCard({
       {expanded && (
         <div className="space-y-2 border-t border-zinc-800 p-2">
           {tools.map((t) => (
-            <ToolCard key={t.id} item={t} onDecide={onDecide} onOpenFile={onOpenFile} embedded />
+            <ToolCard key={t.id} item={t} onDecide={onDecide} onOpenFile={onOpenFile} cwd={cwd} embedded />
           ))}
         </div>
       )}

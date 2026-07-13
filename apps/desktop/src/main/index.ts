@@ -11,6 +11,7 @@ import {
   type FSWatcher,
 } from 'node:fs'
 import { readFile, writeFile, readdir, stat, rename, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
@@ -177,6 +178,23 @@ const presetsPath = (): string => join(app.getPath('userData'), 'presets.json')
  * must not ride along when a repo is shared or committed.
  */
 const modesPath = (): string => join(app.getPath('userData'), 'modes.json')
+
+/**
+ * Project memory lives OUT of the repo, in the same persistent per-project
+ * store the agent's Go core uses (config.MemoryPath): the OS user-config dir
+ * (app.getPath('appData') === Go's os.UserConfigDir on all three platforms),
+ * under codehamr/memory/, keyed by a SHA-256 of the project's absolute path so
+ * two checkouts never collide and the filename leaks nothing. This function
+ * MUST stay byte-identical to the Go derivation or the desktop would edit a
+ * different file than the agent reads - path.resolve matches filepath.Abs+Clean
+ * for the clean workspace paths the dialog yields, and the hash/slice mirror
+ * hex.EncodeToString(sum[:16]) (16 bytes = 32 hex chars).
+ */
+const memoryPath = (cwd: string): string => {
+  const abs = resolve(cwd)
+  const hash = createHash('sha256').update(abs).digest('hex').slice(0, 32)
+  return join(app.getPath('appData'), 'codehamr', 'memory', `${hash}.md`)
+}
 
 function readModes(): Record<string, 'ask' | 'auto'> {
   try {
@@ -516,6 +534,110 @@ function wireIpc(): void {
     const dir = join(cwd, '.codehamr')
     mkdirSync(dir, { recursive: true })
     await writeFile(join(dir, 'transcript.json'), JSON.stringify(items), 'utf8')
+  })
+
+  // -------------------------------------------------------------------------
+  // Project memory: view / edit / download / load the out-of-repo, per-project
+  // memory file the agent grows via its `remember` tool and reads into every
+  // new chat's system prompt. All four actions go through memoryPath so the
+  // desktop and the Go agent always touch the same file.
+  // -------------------------------------------------------------------------
+
+  // Read the current memory (empty string when the project has none yet).
+  ipcMain.handle('memory:read', async (_evt, cwd: string) => {
+    try {
+      return { content: await readFile(memoryPath(cwd), 'utf8'), path: memoryPath(cwd) }
+    } catch {
+      return { content: '', path: memoryPath(cwd) }
+    }
+  })
+
+  // Overwrite memory with user-edited text (the "load your own" and inline-edit
+  // paths both land here). Temp+rename so a crash mid-write can't corrupt it,
+  // mirroring the Go core's AppendMemory. An empty body removes the file, so
+  // "clear memory" leaves no stale bytes to load next chat.
+  ipcMain.handle('memory:write', async (_evt, cwd: string, content: unknown) => {
+    if (typeof content !== 'string') throw new Error('memory content must be a string')
+    const path = memoryPath(cwd)
+    if (content === '') {
+      await rm(path, { force: true })
+      return
+    }
+    mkdirSync(join(app.getPath('appData'), 'codehamr', 'memory'), { recursive: true })
+    const tmp = path + '.tmp'
+    await writeFile(tmp, content, 'utf8')
+    await rename(tmp, path)
+  })
+
+  // Download: copy the current memory to a user-chosen file via the save
+  // dialog. Returns the chosen path (or null if cancelled) so the UI can toast.
+  ipcMain.handle('memory:export', async (_evt, cwd: string) => {
+    if (!win) return null
+    let content = ''
+    try {
+      content = await readFile(memoryPath(cwd), 'utf8')
+    } catch {
+      /* no memory yet: export an empty file so the action never silently no-ops */
+    }
+    const result = await dialog.showSaveDialog(win, {
+      title: 'Export project memory',
+      defaultPath: `codehamr-memory-${cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'project'}.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    })
+    if (result.canceled || !result.filePath) return null
+    await writeFile(result.filePath, content, 'utf8')
+    return result.filePath
+  })
+
+  // Load your own: pick a Markdown/text file and return its contents for the UI
+  // to stage in the editor (the user reviews, then Saves via memory:write).
+  ipcMain.handle('memory:import', async (_evt) => {
+    if (!win) return null
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Load a memory file',
+      properties: ['openFile'],
+      filters: [{ name: 'Markdown / text', extensions: ['md', 'txt', 'markdown'] }],
+    })
+    if (result.canceled || !result.filePaths[0]) return null
+    return await readFile(result.filePaths[0], 'utf8')
+  })
+
+  // Undo a just-saved fact: remove the newest memory line whose text matches
+  // `fact` (the agent writes each as "- <YYYY-MM-DD> <fact>"). Trailing match on
+  // the fact text tolerates the datestamp prefix without the renderer needing to
+  // know the on-disk format. Removing only the LAST match keeps an earlier,
+  // deliberately-kept duplicate intact. Returns true when a line was removed.
+  ipcMain.handle('memory:forget', async (_evt, cwd: string, fact: unknown) => {
+    if (typeof fact !== 'string' || fact.trim() === '') return false
+    const path = memoryPath(cwd)
+    let raw: string
+    try {
+      raw = await readFile(path, 'utf8')
+    } catch {
+      return false // nothing stored: nothing to undo
+    }
+    const target = fact.trim()
+    const lines = raw.split('\n')
+    let removed = -1
+    for (let i = lines.length - 1; i >= 0; i--) {
+      // Match a bullet line ending in the fact text, ignoring the "- <date> "
+      // prefix and any surrounding whitespace.
+      if (lines[i].trim().replace(/^-\s*(\d{4}-\d{2}-\d{2}\s+)?/, '') === target) {
+        removed = i
+        break
+      }
+    }
+    if (removed < 0) return false
+    lines.splice(removed, 1)
+    const next = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+    if (next === '') {
+      await rm(path, { force: true })
+      return true
+    }
+    const tmp = path + '.tmp'
+    await writeFile(tmp, next + '\n', 'utf8')
+    await rename(tmp, path)
+    return true
   })
 
   ipcMain.handle('config:read', async (_evt, cwd: string) => {

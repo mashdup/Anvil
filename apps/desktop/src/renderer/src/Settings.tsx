@@ -46,6 +46,8 @@ export function SettingsPanel({
   const [defaultPreset, setDefaultPreset] = useState<string | null>(null)
   const [selectedPreset, setSelectedPreset] = useState('')
   const [presetName, setPresetName] = useState('')
+  // Which panel tab is showing: the model-profile editor or project memory.
+  const [tab, setTab] = useState<'models' | 'memory'>('models')
 
   const configToForm = (cfg: ConfigFile): void => {
     setActive(cfg.active)
@@ -203,20 +205,45 @@ export function SettingsPanel({
         className="max-h-[85vh] w-[720px] max-w-[95vw] overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-1 flex items-center">
-          <h2 className="text-sm font-semibold">Model profiles</h2>
-          <span className="ml-2 truncate font-mono text-xs text-zinc-500">
-            {workspace}\.codehamr\config.yaml
-          </span>
+        <div className="mb-3 flex items-center">
+          <h2 className="text-sm font-semibold">Settings</h2>
+          <span className="ml-2 truncate font-mono text-xs text-zinc-500">{workspace}</span>
           <button onClick={onClose} className="ml-auto rounded px-2 text-zinc-400 hover:bg-zinc-800">
             ✕
           </button>
         </div>
-        <p className="mb-3 text-xs text-zinc-500">
-          Tip: set <code className="rounded bg-zinc-800 px-1">key</code> to{' '}
-          <code className="rounded bg-zinc-800 px-1">{'${MY_ENV_VAR}'}</code> to read the secret from
-          the environment instead of storing it on disk. Saving restarts the agent.
-        </p>
+
+        <div className="mb-4 flex gap-1 border-b border-zinc-800">
+          {(
+            [
+              ['models', 'Model profiles'],
+              ['memory', 'Project memory'],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`-mb-px border-b-2 px-3 py-1.5 text-xs font-medium ${
+                tab === id
+                  ? 'border-emerald-500 text-zinc-100'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'memory' ? (
+          <MemorySection workspace={workspace} />
+        ) : (
+          <>
+            <p className="mb-3 text-xs text-zinc-500">
+              <span className="font-mono text-zinc-600">{workspace}\.codehamr\config.yaml</span>
+              {' — '}Tip: set <code className="rounded bg-zinc-800 px-1">key</code> to{' '}
+              <code className="rounded bg-zinc-800 px-1">{'${MY_ENV_VAR}'}</code> to read the secret
+              from the environment instead of storing it on disk. Saving restarts the agent.
+            </p>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded border border-zinc-800 bg-zinc-950/50 p-2">
           <span className="text-xs text-zinc-400">Presets</span>
@@ -353,21 +380,148 @@ export function SettingsPanel({
           </div>
         )}
 
-        {error && <p className="mt-3 rounded bg-red-950 px-3 py-2 text-xs text-red-300">{error}</p>}
+            {error && (
+              <p className="mt-3 rounded bg-red-950 px-3 py-2 text-xs text-red-300">{error}</p>
+            )}
 
-        <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="rounded bg-zinc-800 px-4 py-1.5 text-sm hover:bg-zinc-700">
-            Cancel
-          </button>
-          <button
-            onClick={() => void save()}
-            disabled={saving || rows === null || rows.length === 0}
-            className="rounded bg-emerald-700 px-4 py-1.5 text-sm font-medium hover:bg-emerald-600 disabled:opacity-40"
-          >
-            {saving ? 'Saving…' : 'Save & restart agent'}
-          </button>
-        </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={onClose}
+                className="rounded bg-zinc-800 px-4 py-1.5 text-sm hover:bg-zinc-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void save()}
+                disabled={saving || rows === null || rows.length === 0}
+                className="rounded bg-emerald-700 px-4 py-1.5 text-sm font-medium hover:bg-emerald-600 disabled:opacity-40"
+              >
+                {saving ? 'Saving…' : 'Save & restart agent'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
+    </div>
+  )
+}
+
+
+/**
+ * MemorySection: view / edit / download / load the project's persistent memory
+ * - the out-of-repo facts the agent accumulates via its `remember` tool and
+ * reads into every new chat. Edits are staged locally; Save writes the file
+ * (no agent restart needed - memory is read fresh at the start of each chat).
+ */
+function MemorySection({ workspace }: { workspace: string }): React.JSX.Element {
+  const [text, setText] = useState<string | null>(null)
+  const [saved, setSaved] = useState('') // last-persisted content, to detect edits
+  const [status, setStatus] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    void window.codehamr.readMemory(workspace).then((m) => {
+      setText(m.content)
+      setSaved(m.content)
+    })
+  }, [workspace])
+
+  const dirty = text !== null && text !== saved
+
+  const save = async (): Promise<void> => {
+    if (text === null) return
+    setBusy(true)
+    setStatus('')
+    try {
+      await window.codehamr.writeMemory(workspace, text)
+      setSaved(text)
+      setStatus('saved — loads into the next chat')
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const download = async (): Promise<void> => {
+    setStatus('')
+    try {
+      const path = await window.codehamr.exportMemory(workspace)
+      if (path) setStatus(`exported to ${path}`)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // Load a file into the editor for review; the user then Saves to persist.
+  const load = async (): Promise<void> => {
+    setStatus('')
+    try {
+      const content = await window.codehamr.importMemory()
+      if (content !== null) {
+        setText(content)
+        setStatus('loaded into the editor — review, then Save to apply')
+      }
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const clear = (): void => {
+    setText('')
+    setStatus('cleared in the editor — Save to wipe stored memory')
+  }
+
+  return (
+    <div>
+      <p className="mb-3 text-xs text-zinc-500">
+        <span className="text-zinc-400">out-of-repo · loads into every new chat.</span> Durable
+        facts the agent learns about this project (build commands, where things live, conventions).
+        It grows automatically as you work, and is stored outside your repo — nothing is written into
+        the project folder.
+      </p>
+      {text === null ? (
+        <p className="py-4 text-center text-sm text-zinc-500">Loading…</p>
+      ) : (
+        <>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            spellCheck={false}
+            placeholder="No memory yet — the agent adds facts here as it works, or you can write your own."
+            className="h-40 w-full resize-y rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 font-mono text-xs leading-relaxed outline-none focus:border-zinc-500"
+          />
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void save()}
+              disabled={busy || !dirty}
+              className="rounded bg-emerald-700 px-3 py-1 text-xs font-medium hover:bg-emerald-600 disabled:opacity-40"
+            >
+              {busy ? 'Saving…' : 'Save memory'}
+            </button>
+            <button
+              onClick={() => void download()}
+              className="rounded bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+            >
+              Download…
+            </button>
+            <button
+              onClick={() => void load()}
+              className="rounded bg-zinc-800 px-3 py-1 text-xs hover:bg-zinc-700"
+            >
+              Load file…
+            </button>
+            <button
+              onClick={clear}
+              disabled={text === ''}
+              className="rounded px-3 py-1 text-xs text-red-400 hover:bg-red-950 disabled:opacity-30"
+            >
+              Clear
+            </button>
+            {status && <span className="ml-auto truncate text-[11px] text-zinc-500">{status}</span>}
+          </div>
+        </>
+      )}
     </div>
   )
 }
