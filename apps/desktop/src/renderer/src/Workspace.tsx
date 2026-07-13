@@ -258,11 +258,16 @@ function BarMenuItem({
 // Responsive three-pane layout. The file tree and preview are fixed-width side
 // panels; the chat column is the flexible middle. Naively they'd squeeze the
 // chat to nothing on a narrow window. Instead we measure the container and give
-// the chat first claim on MIN_CHAT px; each side panel is shown only if it
-// (down to its minimum) still fits in what's left, and otherwise auto-hides.
+// the chat first claim on MIN_CHAT px; each side panel is shown inline only if
+// it (down to its minimum) still fits in what's left, and otherwise falls back
+// to a floating modal overlay over the chat rather than eating into it.
 // Priority when space runs out: chat > file tree > preview. The tree is small
 // and is primary navigation; the preview is large and transient (reopened by
-// clicking a file), so it's the first to go.
+// clicking a file), so it's the first to be pushed to an overlay.
+//
+// Overlays respect a strict view hierarchy so an open panel is never buried:
+// the file preview stacks on top of everything until closed, the file browser
+// (tree) is a modal above the chat but below the preview.
 // ---------------------------------------------------------------------------
 
 const MIN_CHAT = 380 // chat keeps at least this many px; panels hide before eating into it
@@ -271,7 +276,13 @@ const TREE_MAX = 560
 const PREVIEW_MIN = 300
 const HANDLE_W = 4 // ResizeHandle width (w-1) + slack
 
-type PanelMode = 'inline' | 'hidden'
+// 'inline' — a fixed side column that eats into the container.
+// 'overlay' — the panel is open but there's no room to seat it inline, so it
+//   floats as a modal over the chat. Overlays respect a view hierarchy: the
+//   file preview sits on top of everything, the file browser (tree) is a modal
+//   above the chat but below the preview.
+// 'hidden' — the user has the panel closed.
+type PanelMode = 'inline' | 'overlay' | 'hidden'
 type PanelLayout = { mode: PanelMode; width: number }
 
 function computeLayout(
@@ -281,19 +292,19 @@ function computeLayout(
   treeW: number,
   previewW: number,
 ): { tree: PanelLayout; preview: PanelLayout } {
-  const tree: PanelLayout = { mode: 'hidden', width: treeW }
-  const preview: PanelLayout = { mode: 'hidden', width: previewW }
+  const tree: PanelLayout = { mode: showTree ? 'overlay' : 'hidden', width: treeW }
+  const preview: PanelLayout = { mode: showPreview ? 'overlay' : 'hidden', width: previewW }
   // Reserve the chat's minimum up front; panels draw only from what remains.
   let remaining = cw - MIN_CHAT
 
   // Tree gets first refusal (small, primary navigation). It may shrink toward
-  // its minimum to fit; below that it stays hidden.
+  // its minimum to fit; below that it falls back to an overlay modal.
   if (showTree && remaining >= TREE_MIN + HANDLE_W) {
     tree.mode = 'inline'
     tree.width = Math.min(treeW, remaining - HANDLE_W)
     remaining -= tree.width + HANDLE_W
   }
-  // Preview takes whatever's left, shrinking toward its minimum, else hides.
+  // Preview takes whatever's left, shrinking toward its minimum, else overlays.
   if (showPreview && remaining >= PREVIEW_MIN + HANDLE_W) {
     preview.mode = 'inline'
     preview.width = Math.min(previewW, remaining - HANDLE_W)
@@ -391,6 +402,7 @@ export default function Workspace({
   const [mode, setMode] = useState<PermissionMode>('ask')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [dragOver, setDragOver] = useState(false)
+  const dragDepth = useRef(0)
   const [showFiles, setShowFiles] = useState(true)
   const [treeWidth, setTreeWidth] = usePanelWidth('tree', 224)
   const [previewWidth, setPreviewWidth] = usePanelWidth('preview', 480)
@@ -580,6 +592,7 @@ export default function Workspace({
           break
         case 'cleared':
           setItems([])
+          resetSessionStats()
           break
         case 'compacted':
           endTurn()
@@ -884,6 +897,16 @@ export default function Workspace({
     }
   }
 
+  // Token/context readouts describe the *active* session's last turn, so they
+  // must be dropped when the session changes — otherwise the stale count and
+  // context-window bar carry over into a freshly opened or switched-to chat.
+  const resetSessionStats = (): void => {
+    setLastInference(null)
+    setStreamMeter(null)
+    genStartRef.current = null
+    lastGenMsRef.current = null
+  }
+
   const newChat = async (): Promise<void> => {
     if (!connected || busy) return
     setHistoryOpen(false)
@@ -892,6 +915,7 @@ export default function Workspace({
     await window.codehamr.newChatSession(cwd) // archives the current pair
     setItems([])
     setQueue([])
+    resetSessionStats()
     await window.codehamr.startAgent(cwd)
   }
 
@@ -903,6 +927,7 @@ export default function Workspace({
     await window.codehamr.switchChat(cwd, id)
     await loadTranscriptFromDisk()
     setQueue([])
+    resetSessionStats()
     await window.codehamr.startAgent(cwd)
   }
 
@@ -1388,6 +1413,34 @@ export default function Workspace({
     }
   }, [barMenuOpen])
 
+  // Drop-overlay safety net. The depth-counted enter/leave handlers on the
+  // container clear the overlay in the normal case, but a drag can end without
+  // any leave/drop landing on us: cancelled with Escape, dropped outside the
+  // window, or swallowed by the out-of-process <webview>. These window-level
+  // listeners guarantee the "drop files" banner never gets stranded on screen.
+  useEffect(() => {
+    if (!dragOver) return
+    const clear = (): void => {
+      dragDepth.current = 0
+      setDragOver(false)
+    }
+    // A dragleave whose relatedTarget is null means the pointer left the
+    // window entirely; a global drop/dragend covers drops that never reach us.
+    const onLeave = (e: DragEvent): void => {
+      if (!e.relatedTarget) clear()
+    }
+    window.addEventListener('drop', clear)
+    window.addEventListener('dragend', clear)
+    window.addEventListener('dragleave', onLeave)
+    window.addEventListener('blur', clear)
+    return () => {
+      window.removeEventListener('drop', clear)
+      window.removeEventListener('dragend', clear)
+      window.removeEventListener('dragleave', onLeave)
+      window.removeEventListener('blur', clear)
+    }
+  }, [dragOver])
+
   // Keyboard shortcuts, active tab only.
   useEffect(() => {
     if (!visible) return
@@ -1405,6 +1458,8 @@ export default function Workspace({
         if (searchOpen) {
           setSearchOpen(false)
           setQuery('')
+        } else if (historyOpen) {
+          setHistoryOpen(false)
         } else if (viewer) {
           closeViewer()
         }
@@ -1412,11 +1467,49 @@ export default function Workspace({
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [visible, searchOpen, viewer])
+  }, [visible, searchOpen, historyOpen, viewer])
+
+  // The stacked preview panels (file viewer + live browser), rendered the same
+  // whether they sit inline in the column or float as an overlay modal.
+  const previewStack = (
+    <>
+      {panelOrder.map((p, i) => {
+        const both = panelOrder.length === 2
+        const isTop = i === 0
+        const flex = both
+          ? { flexGrow: isTop ? splitRatio : 1 - splitRatio, flexShrink: 1, flexBasis: 0 }
+          : { flex: '1 1 0' }
+        return (
+          <Fragment key={p}>
+            {i > 0 && <RowResizeHandle onResize={adjustSplit} />}
+            <div className="flex min-h-0 min-w-0" style={{ ...flex, minHeight: both ? 160 : 0 }}>
+              {p === 'file'
+                ? viewer && (
+                    <FilePreview
+                      preview={viewer}
+                      workspaceRoot={cwd}
+                      onClose={closeViewer}
+                      onUseInPrompt={useSnippetInPrompt}
+                    />
+                  )
+                : browserOpen && (
+                    <BrowserPane cwd={cwd} navigate={browserNav} onClose={closeBrowser} />
+                  )}
+            </div>
+          </Fragment>
+        )
+      })}
+    </>
+  )
 
   return (
     <div
       className={`${visible ? 'flex' : 'hidden'} relative min-h-0 flex-1 flex-col`}
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes('Files')) return
+        dragDepth.current += 1
+        setDragOver(true)
+      }}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault()
@@ -1424,10 +1517,13 @@ export default function Workspace({
         }
       }}
       onDragLeave={(e) => {
-        if (e.currentTarget === e.target) setDragOver(false)
+        if (!e.dataTransfer.types.includes('Files')) return
+        dragDepth.current = Math.max(0, dragDepth.current - 1)
+        if (dragDepth.current === 0) setDragOver(false)
       }}
       onDrop={(e) => {
         e.preventDefault()
+        dragDepth.current = 0
         setDragOver(false)
         if (connected) void addFiles(e.dataTransfer.files)
       }}
@@ -1541,60 +1637,19 @@ export default function Workspace({
             </button>
           </>
         )}
-        {historyOpen && (
-          <div className="absolute top-full left-3 z-20 mt-1 max-h-80 w-96 overflow-y-auto rounded border border-zinc-700 bg-zinc-900 py-1 shadow-xl">
-            {chats.map((c) => (
-              <div
-                key={c.id}
-                className={`group flex items-center gap-2 px-3 py-1.5 text-xs ${
-                  c.current ? 'text-emerald-300' : 'text-zinc-300 hover:bg-zinc-800'
-                }`}
-              >
-                <button
-                  onClick={() => void switchToChat(c.id)}
-                  disabled={c.current}
-                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                >
-                  <span className="truncate">{c.title}</span>
-                  {c.current && <span className="shrink-0 text-[10px] text-emerald-500">· active</span>}
-                  <span className="ml-auto shrink-0 text-[10px] text-zinc-500">
-                    {new Date(c.updatedAt).toLocaleString(undefined, {
-                      month: 'short',
-                      day: 'numeric',
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })}
-                  </span>
-                </button>
-                {!c.current && (
-                  <button
-                    onClick={() => void removeChat(c.id)}
-                    title="delete this chat permanently"
-                    className="shrink-0 rounded px-1 text-zinc-600 opacity-0 group-hover:opacity-100 hover:bg-red-950 hover:text-red-400"
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
-            ))}
-            {chats.length === 0 && (
-              <p className="px-3 py-2 text-xs text-zinc-500">no chats yet</p>
-            )}
-          </div>
-        )}
         {!compactBar && (
           <>
             <button
               onClick={() => setShowFiles((s) => !s)}
               title={
-                showFiles && layout.tree.mode === 'hidden'
-                  ? 'file tree hidden — window too narrow (widen to show)'
+                showFiles && layout.tree.mode === 'overlay'
+                  ? 'file tree shown as an overlay — window too narrow to dock it'
                   : 'toggle the file tree (Ctrl+B)'
               }
               className={`rounded px-2.5 py-0.5 text-xs hover:bg-zinc-700 ${
                 showFiles
-                  ? layout.tree.mode === 'hidden'
-                    ? 'bg-zinc-800 text-zinc-500 italic' // wants to show but collapsed by width
+                  ? layout.tree.mode === 'overlay'
+                    ? 'bg-zinc-800 text-zinc-300 italic' // shown, but floating over the chat
                     : 'bg-zinc-700'
                   : 'bg-zinc-800'
               }`}
@@ -1745,6 +1800,34 @@ export default function Workspace({
               onResize={(dx) => setTreeWidth((w) => clamp(w + dx, TREE_MIN, TREE_MAX))}
             />
           </>
+        )}
+
+        {/* File browser as a modal drawer when there's no room to seat it
+            inline. It floats above the chat but below the file preview (z-30 <
+            preview's z-40), honoring the view hierarchy. */}
+        {layout.tree.mode === 'overlay' && (
+          <div className="absolute inset-0 z-30 flex">
+            <aside className="relative flex w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl">
+              <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 px-3 py-1.5">
+                <span className="text-xs font-medium text-zinc-400">Files</span>
+                <button
+                  onClick={() => setShowFiles(false)}
+                  title="close file browser"
+                  className="rounded px-1 text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-hidden">
+                <FileTree
+                  root={cwd}
+                  touched={touched}
+                  reload={treeReload}
+                  onOpen={(p) => void openFile(p)}
+                />
+              </div>
+            </aside>
+          </div>
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -2119,34 +2202,23 @@ export default function Workspace({
               style={{ width: layout.preview.width }}
               className="flex shrink-0 flex-col overflow-hidden"
             >
-              {panelOrder.map((p, i) => {
-                const both = panelOrder.length === 2
-                const isTop = i === 0
-                const flex = both
-                  ? { flexGrow: isTop ? splitRatio : 1 - splitRatio, flexShrink: 1, flexBasis: 0 }
-                  : { flex: '1 1 0' }
-                return (
-                  <Fragment key={p}>
-                    {i > 0 && <RowResizeHandle onResize={adjustSplit} />}
-                    <div className="flex min-h-0 min-w-0" style={{ ...flex, minHeight: both ? 160 : 0 }}>
-                      {p === 'file'
-                        ? viewer && (
-                            <FilePreview
-                              preview={viewer}
-                              workspaceRoot={cwd}
-                              onClose={closeViewer}
-                              onUseInPrompt={useSnippetInPrompt}
-                            />
-                          )
-                        : browserOpen && (
-                            <BrowserPane cwd={cwd} navigate={browserNav} onClose={closeBrowser} />
-                          )}
-                    </div>
-                  </Fragment>
-                )
-              })}
+              {previewStack}
             </div>
           </>
+        )}
+
+        {/* Preview as a modal overlay when there's no room to seat it inline.
+            It sits on top of everything (z-40, above the file browser's z-30)
+            until closed, honoring the view hierarchy. */}
+        {previewInUse && layout.preview.mode === 'overlay' && (
+          <div className="absolute inset-0 z-40 flex">
+            <div
+              ref={previewSlotRef}
+              className="relative flex w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl"
+            >
+              {previewStack}
+            </div>
+          </div>
         )}
       </div>
 
@@ -2203,6 +2275,70 @@ export default function Workspace({
                 <p className="px-4 py-3 text-xs text-zinc-600">
                   type to search this chat — click a result to jump to it
                 </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {historyOpen && (
+        <div
+          className="fixed inset-0 z-40 flex items-start justify-center bg-black/50 pt-24"
+          onClick={() => setHistoryOpen(false)}
+        >
+          <div
+            className="w-[560px] max-w-[90vw] overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+              <span className="text-sm font-medium text-zinc-200">Chat history</span>
+              <button
+                onClick={() => setHistoryOpen(false)}
+                title="close"
+                className="rounded px-1 text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto py-1">
+              {chats.map((c) => (
+                <div
+                  key={c.id}
+                  className={`group flex items-center gap-2 px-4 py-2 text-sm ${
+                    c.current ? 'text-emerald-300' : 'text-zinc-300 hover:bg-zinc-800'
+                  }`}
+                >
+                  <button
+                    onClick={() => void switchToChat(c.id)}
+                    disabled={c.current}
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  >
+                    <span className="truncate">{c.title}</span>
+                    {c.current && (
+                      <span className="shrink-0 text-[10px] text-emerald-500">· active</span>
+                    )}
+                    <span className="ml-auto shrink-0 text-[10px] text-zinc-500">
+                      {new Date(c.updatedAt).toLocaleString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
+                  </button>
+                  {!c.current && (
+                    <button
+                      onClick={() => void removeChat(c.id)}
+                      title="delete this chat permanently"
+                      className="shrink-0 rounded px-1 text-zinc-600 opacity-0 group-hover:opacity-100 hover:bg-red-950 hover:text-red-400"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+              {chats.length === 0 && (
+                <p className="px-4 py-3 text-xs text-zinc-500">no chats yet</p>
               )}
             </div>
           </div>
