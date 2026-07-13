@@ -3,7 +3,7 @@ name: Release
 # Tag v* (matching apps/desktop/package.json's version, e.g. v0.1.0) to build
 # installers with the bundled agent and publish them to a GitHub Release.
 #
-# Design: the two platform jobs BUILD ONLY (`electron-builder --publish never`)
+# Design: the platform jobs BUILD ONLY (`electron-builder --publish never`)
 # and upload their outputs as workflow artifacts. A single `release` job then
 # creates ONE draft release and attaches everything.
 #
@@ -98,11 +98,42 @@ jobs:
             apps/desktop/release/latest-mac.yml
           if-no-files-found: error
 
-  # Single publisher: collect both platforms' artifacts and create ONE draft
-  # release. Runs only after both builds succeed.
+  linux:
+    runs-on: ubuntu-latest # x64; AppImage targets x64 (see electron-builder.yml)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: codehamr/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: build agent (GOEXPERIMENT=nogreenteagc)
+        run: npm run agent:build
+      - name: build app
+        run: npm run build
+      - name: package AppImage (build only)
+        run: npx electron-builder --linux --publish never
+        working-directory: apps/desktop
+      - name: upload linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: |
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/latest-linux.yml
+          if-no-files-found: error
+
+  # Single publisher: collect every platform's artifacts and create ONE draft
+  # release. Runs only after all builds succeed.
   release:
     runs-on: ubuntu-latest
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     steps:
       - name: download all platform artifacts
         uses: actions/download-artifact@v4

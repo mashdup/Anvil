@@ -58,6 +58,21 @@ mac:
     - from: ../../codehamr/dist/codehamr
       to: agent/codehamr
 
+# Linux: built by the release workflow on an ubuntu (x64) runner. No bundled
+# shell (a real /bin/sh is always present, so resolveShell returns null and the
+# agent uses the system shell) and no signing. AppImage is the portable target
+# electron-updater can update from (latest-linux.yml); the agent binary lands
+# in resources/agent/codehamr, exactly where resolveBinary looks on non-Windows.
+linux:
+  icon: build/icon.png
+  category: Development
+  target:
+    - target: AppImage
+      arch: [x64]
+  extraResources:
+    - from: ../../codehamr/dist/codehamr
+      to: agent/codehamr
+
 # Where releases land; also baked into the app for a future electron-updater
 # (P6). CI publishes on v* tags with GH_TOKEN; local builds never publish.
 publish:
