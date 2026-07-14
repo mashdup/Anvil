@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
 import { highlight } from '../syntax'
+import { MermaidRenderer } from './MermaidRenderer'
 
 /** Markdown renderer for assistant bubbles, styled for the dark transcript. */
 // Custom code renderer: syntax-highlight fenced blocks with the shared hljs;
@@ -15,6 +16,13 @@ function MdCode({
   children?: React.ReactNode
 }): React.JSX.Element {
   const lang = /language-(\w+)/.exec(className ?? '')?.[1]
+
+  // --- Mermaid Integration ---
+  if (lang === 'mermaid') {
+    return <MermaidRenderer code={String(children).replace(/\n$/, '')} />
+  }
+  // ---------------------------
+
   const html = lang ? highlight(String(children).replace(/\n$/, ''), lang) : null
   if (html) {
     return <code className="hljs !bg-transparent" dangerouslySetInnerHTML={{ __html: html }} />
