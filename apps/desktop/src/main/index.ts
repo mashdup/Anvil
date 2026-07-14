@@ -1168,6 +1168,11 @@ function wireAutoUpdate(): void {
     autoUpdater.quitAndInstall()
   })
   void autoUpdater.checkForUpdates()
+
+  // Periodically check for updates every 6 hours
+  setInterval(() => {
+    void autoUpdater.checkForUpdates()
+  }, 6 * 60 * 60 * 1000)
 }
 
 app.whenReady().then(() => {

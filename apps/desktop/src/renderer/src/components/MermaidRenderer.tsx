@@ -73,9 +73,98 @@ export function MermaidRenderer({ code }: MermaidRendererProps): React.JSX.Eleme
     URL.revokeObjectURL(url);
   };
 
+  const [expanded, setExpanded] = useState(false);
+
+  const diagramView = (fullSize = false) => (
+    <div className={`relative border border-zinc-800 rounded-lg bg-zinc-950/50 overflow-hidden ${fullSize ? 'w-full h-full' : ''}`}>
+      <TransformWrapper initialScale={1} minScale={0.2} maxScale={10}>
+        {({ zoomIn, zoomOut, resetTransform }) => (
+          <>
+            {/* Floating Controls */}
+            <div className="absolute bottom-2 right-2 z-10 flex gap-1">
+              <button
+                onClick={() => zoomIn()}
+                className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
+                title="Zoom In"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+              </button>
+              <button
+                onClick={() => zoomOut()}
+                className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
+                title="Zoom Out"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+              </button>
+              <button
+                onClick={() => resetTransform()}
+                className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
+                title="Reset"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+              </button>
+              <button
+                onClick={exportSvg}
+                className="p-1.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-400 transition-colors border border-blue-800/50"
+                title="Export SVG"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              </button>
+              {!fullSize && (
+                <button
+                  onClick={() => setExpanded(true)}
+                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
+                  title="Expand"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+                </button>
+              )}
+            </div >
+
+            <TransformComponent
+              wrapperStyle={{ width: '100%', height: '100%' }}
+            >
+              <div
+                className="mermaid-svg-container flex justify-center min-h-[40px] p-4"
+                dangerouslySetInnerHTML={{ __html: svgContent ?? '' }}
+              />
+            </TransformComponent>
+          </>
+        )}
+      </TransformWrapper>
+    </div >
+  );
+
   return (
-    <div className="my-4 flex flex-col items-center justify-center w-full overflow-hidden">
-      {error && (
+    <>
+      {expanded && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-8"
+          onClick={() => setExpanded(false)}
+        >
+          <div
+            className="relative flex h-full w-full max-w-[90vw] max-h-[90vh] flex-col rounded-lg border border-zinc-700 bg-zinc-950 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Title bar */}
+            <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 px-4 py-2">
+              <span className="text-sm font-medium text-zinc-300">Diagram</span>
+              <button
+                onClick={() => setExpanded(false)}
+                className="rounded px-2 py-0.5 text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                title="close"
+              >
+                ✕
+              </button>
+            </div>
+            {/* Diagram fills remaining space */}
+            <div className="flex-1 min-h-0">{diagramView(true)}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="my-4 flex flex-col items-center justify-center w-full overflow-hidden">
+        {error && (
         <div className="rounded border border-red-900/50 bg-red-900/20 p-3 text-xs text-red-400">
           <p className="font-bold">Mermaid Error:</p>
           <p>{error}</p>
@@ -83,68 +172,9 @@ export function MermaidRenderer({ code }: MermaidRendererProps): React.JSX.Eleme
       )}
 
       {!error && svgContent && (
-        <div className="w-full h-full min-h-[200px] relative border border-zinc-800 rounded-lg bg-zinc-950/50 overflow-hidden">
-          <TransformWrapper
-            initialScale={1}
-            minScale={0.2}
-            maxScale={10}
-          >
-            {({ zoomIn, zoomOut, resetTransform }) => (
-              <>
-                {/* Floating Controls */}
-                <div className="absolute bottom-2 right-2 z-10 flex gap-1">
-                  <button
-                    onClick={() => zoomIn()}
-                    className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
-                    title="Zoom In"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-                  </button>
-                  <button
-                    onClick={() => zoomOut()}
-                    className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
-                    title="Zoom Out"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-                  </button>
-                  <button
-                    onClick={() => resetTransform()}
-                    className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
-                    title="Reset"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-                  </button>
-                  <button
-                    onClick={exportSvg}
-                    className="p-1.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-400 transition-colors border border-blue-800/50"
-                    title="Export SVG"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                  </button>
-                </div >
-
-                <TransformComponent
-                  wrapperStyle={{
-                    width: '100%',
-                    height: '100%',
-                  }}
-                >
-                  <div
-                    className="mermaid-svg-container flex justify-center min-h-[40px] p-4"
-                    // Declarative, not imperative: this div only mounts once svgContent is
-                    // truthy (see the conditional above). An effect that instead wrote into
-                    // a ref *before* setSvgContent would race the mount - the ref is still
-                    // null at that point, since this div doesn't exist yet - which was
-                    // exactly the bug that made previously-working diagrams render blank.
-                    // dangerouslySetInnerHTML paints in the same render pass as the mount.
-                    dangerouslySetInnerHTML={svgContent ? { __html: svgContent } : undefined}
-                  />
-                </TransformComponent>
-              </>
-            )}
-          </TransformWrapper>
-        </div >
+        <div className="w-full h-full min-h-[200px]">{diagramView(false)}</div>
       )}
     </div >
+    </>
   );
 }

@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import type { Decide, Item } from '../workspace/types'
 import { Markdown } from './Markdown'
 import { ToolCard } from './ToolCard'
 
-export function TranscriptItem({
+export const TranscriptItem = memo(function TranscriptItem({
   item,
   onDecide,
   onOpenFile,
@@ -62,7 +62,7 @@ export function TranscriptItem({
         </div>
       )
   }
-}
+})
 
 /**
  * ReasoningCard: live-streams chain-of-thought while thinking, collapses to a

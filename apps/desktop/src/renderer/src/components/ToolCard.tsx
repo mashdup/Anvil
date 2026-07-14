@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import type { Decide, ToolItem, ToolStatus } from '../workspace/types'
 import { numberDiffLines, gut } from '../workspace/diff'
 
@@ -78,7 +78,7 @@ function toolSummary(name: string, args: Record<string, unknown>): string {
   }
 }
 
-export function ToolCard({
+export const ToolCard = memo(function ToolCard({
   item,
   onDecide,
   onOpenFile,
@@ -227,7 +227,7 @@ export function ToolCard({
       )}
     </div>
   )
-}
+})
 
 /**
  * ToolGroupCard: consecutive tool calls collapse into one summary row —
@@ -235,7 +235,7 @@ export function ToolCard({
  * in cards. Click to reveal the individual calls. Forced open while any call
  * inside still needs approval or is running (Allow/Deny must stay reachable).
  */
-export function ToolGroupCard({
+export const ToolGroupCard = memo(function ToolGroupCard({
   tools,
   onDecide,
   onOpenFile,
@@ -310,7 +310,7 @@ export function ToolGroupCard({
       )}
     </div>
   )
-}
+})
 
 /**
  * DiffBlock: colored unified diff, auto-expanded — seeing what the agent

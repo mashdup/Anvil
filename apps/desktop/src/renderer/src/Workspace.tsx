@@ -8,7 +8,8 @@ import { BrowserPane } from './BrowserPane'
 import { StatusBar, ContextMeter, VisionHint } from './components/StatusBar'
 import { TranscriptItem } from './components/TranscriptItem'
 import { ToolGroupCard } from './components/ToolCard'
-import { Markdown } from './components/Markdown'
+import { Composer } from './components/Composer'
+
 import { ResizeHandle, RowResizeHandle, BarMenuItem } from './components/ResizeHandle'
 import { SearchModal, HistoryModal } from './components/Modals'
 import type { Attachment, ImageAttachment, FileAttachment, Item, ToolItem, Phase, SlashCmd, ChatEntry } from './workspace/types'
@@ -90,9 +91,6 @@ export default function Workspace({
   const { currentBranch, diffStats, changedPaths, refreshGitStat } = useGitStatus(cwd)
   const [input, setInput] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  // Markdown preview of the draft: render the composer text so lists, code
-  // blocks etc. are easy to eyeball before sending. Off while empty.
-  const [mdPreview, setMdPreview] = useState(false)
   // Slash-command palette: highlighted row, and a dismissed flag so Escape can
   // hide the popover without clearing what the user typed.
   const [slashSel, setSlashSel] = useState(0)
@@ -136,6 +134,24 @@ export default function Workspace({
   const prefillMsRef = useRef<number | null>(null) // time-to-first-token of the current round
   const roundStartRef = useRef<number | null>(null) // when the current round's wait began
   const scrollRef = useRef<HTMLDivElement>(null)
+  // True while the user has manually scrolled away from the bottom. While true,
+  // auto-scroll-on-content is suppressed and a gradient overlay hints at new
+  // content below. Resets whenever the user scrolls back to the bottom.
+  const [userScrolledUp, setUserScrolledUp] = useState(false)
+  const userScrolledUpRef = useRef(false) // mirror for hot-path reads in effects
+  const AT_BOTTOM_THRESHOLD = 20 // px from true bottom to consider "at bottom"
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    const atBottom = distFromBottom < AT_BOTTOM_THRESHOLD
+    userScrolledUpRef.current = !atBottom
+    setUserScrolledUp(!atBottom)
+  }, [])
+  // TipTap editor instance from the Composer, for programmatic text operations
+  // (snippet insertion, clipboard actions, focus, selection).
+
 
   const push = useCallback((item: Item) => {
     setItems((prev) => [...prev, item])
@@ -426,18 +442,12 @@ export default function Workspace({
   }, [turnStart])
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+    if (!userScrolledUpRef.current) {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+    }
   }, [items])
 
-  // Auto-grow the composer with its content, between ~2 lines and a cap, then
-  // scroll internally. Runs on every input change (typing, paste, snippet
-  // insert, and clear-on-send).
-  useEffect(() => {
-    const el = inputRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    el.style.height = `${Math.max(52, Math.min(el.scrollHeight, 260))}px`
-  }, [input])
+  // Composer auto-grow is handled inside the Composer component (TipTap).
 
   // Boot: restore the saved transcript, then start (or adopt) the agent.
   const loadedRef = useRef(false)
@@ -679,9 +689,20 @@ export default function Workspace({
   // run immediately.
   const pickSlash = (c: SlashCmd): void => {
     if (c.arg) {
-      setInput(c.name + ' ')
+      const cmdText = c.name + ' '
+      const ed = editorRef.current
+      if (ed) {
+        // Replace the whole document with the command prefix — the slash
+        // palette was triggered by typing "/", so we swap it for the full
+        // command name + trailing space, then focus at the end.
+        ed.chain().focus().setContent(cmdText, { emitUpdate: false }).run()
+        // Set state from the editor so sendPrompt etc. see the current text.
+        const md = (ed.storage as { markdown?: { getMarkdown: () => string } }).markdown?.getMarkdown() ?? ''
+        setInput(md)
+      } else {
+        setInput(cmdText)
+      }
       setSlashClosed(true)
-      inputRef.current?.focus()
     } else {
       setInput('')
       void runSlash(c.name)
@@ -696,7 +717,6 @@ export default function Workspace({
     // aren't part of an answer, so only plain text routes here.
     if (ask && text && attachments.length === 0) {
       setInput('')
-      setMdPreview(false)
       await answerAsk(-1, text)
       return
     }
@@ -711,7 +731,6 @@ export default function Workspace({
     const atts = attachments
     setInput('')
     setAttachments([])
-    setMdPreview(false)
     // Mid-turn: queue instead of rejecting — it dispatches when the turn ends.
     if (busy) {
       setQueue((q) => [...q, { text, images: atts }])
@@ -741,27 +760,30 @@ export default function Workspace({
     })
   }
 
-  const decide = async (
-    callId: string,
-    decision: 'allow' | 'deny',
-    scope?: 'session',
-  ): Promise<void> => {
-    setItems((prev) =>
-      prev.map((it) =>
-        it.kind === 'tool' && it.id === callId
-          ? { ...it, status: decision === 'allow' ? 'running' : 'denied' }
-          : it,
-      ),
-    )
-    if (decision === 'allow') setPhase('tool')
-    await window.codehamr.send(cwd, {
-      v: PROTOCOL_VERSION,
-      type: 'approve',
-      callId,
-      decision,
-      scope,
-    })
-  }
+  const decide = useCallback(
+    async (
+      callId: string,
+      decision: 'allow' | 'deny',
+      scope?: 'session',
+    ): Promise<void> => {
+      setItems((prev) =>
+        prev.map((it) =>
+          it.kind === 'tool' && it.id === callId
+            ? { ...it, status: decision === 'allow' ? 'running' : 'denied' }
+            : it,
+        ),
+      )
+      if (decision === 'allow') setPhase('tool')
+      await window.codehamr.send(cwd, {
+        v: PROTOCOL_VERSION,
+        type: 'approve',
+        callId,
+        decision,
+        scope,
+      })
+    },
+    [cwd],
+  )
 
   // Answer a pending ask_user: either a chosen option (selection >= 0) or a
   // typed custom answer (selection -1 + custom text). Either way the turn
@@ -787,62 +809,71 @@ export default function Workspace({
 
   /** Insert a snippet from the preview pane into the chat input, then focus. */
   const useSnippetInPrompt = (snippet: string): void => {
-    setInput((prev) => (prev.trim() ? `${prev.replace(/\s*$/, '')}\n\n${snippet}\n` : `${snippet}\n`))
-    requestAnimationFrame(() => {
-      const el = inputRef.current
-      if (el) {
-        el.focus()
-        el.selectionStart = el.selectionEnd = el.value.length
-      }
-    })
+    const ed = editorRef.current
+    if (ed) {
+      ed.commands.focus()
+      ed.commands.insertContent(snippet)
+    } else {
+      setInput((prev) => (prev.trim() ? `${prev.replace(/\s*$/, '')}\n\n${snippet}\n` : `${snippet}\n`))
+    }
   }
 
-  // --- Composer right-click clipboard actions. Each works off the selection
-  // captured when the menu opened, then restores focus + caret. -------------
-  const restoreCaret = (pos: number): void => {
-    requestAnimationFrame(() => {
-      const el = inputRef.current
-      if (el) {
-        el.focus()
-        el.selectionStart = el.selectionEnd = pos
-      }
-    })
-  }
+  // --- Composer right-click clipboard actions. Each works off the editor's
+  // current selection, then restores focus. --------------------------------
   const copyInput = (): void => {
     if (!inputMenu) return
-    const sel = input.slice(inputMenu.start, inputMenu.end)
-    if (sel) void window.codehamr.writeClipboard(sel)
+    const ed = editorRef.current
+    if (ed) {
+      const { from, to } = ed.state.selection
+      if (from !== to) {
+        const sel = ed.state.doc.textBetween(from, to, '\n')
+        if (sel) void window.codehamr.writeClipboard(sel)
+      }
+    } else {
+      const sel = input.slice(inputMenu.start, inputMenu.end)
+      if (sel) void window.codehamr.writeClipboard(sel)
+    }
     setInputMenu(null)
   }
   const cutInput = (): void => {
     if (!inputMenu) return
-    const { start, end } = inputMenu
-    const sel = input.slice(start, end)
-    if (sel) {
-      void window.codehamr.writeClipboard(sel)
-      setInput(input.slice(0, start) + input.slice(end))
-      restoreCaret(start)
+    const ed = editorRef.current
+    if (ed) {
+      const { from, to } = ed.state.selection
+      if (from !== to) {
+        const sel = ed.state.doc.textBetween(from, to, '\n')
+        if (sel) void window.codehamr.writeClipboard(sel)
+        ed.chain().focus().deleteRange({ from, to }).run()
+      }
+    } else {
+      const { start, end } = inputMenu
+      const sel = input.slice(start, end)
+      if (sel) {
+        void window.codehamr.writeClipboard(sel)
+        setInput(input.slice(0, start) + input.slice(end))
+      }
     }
     setInputMenu(null)
   }
   const pasteInput = async (): Promise<void> => {
     if (!inputMenu) return
-    const { start, end } = inputMenu
-    const text = await window.codehamr.readClipboard()
     setInputMenu(null)
+    const text = await window.codehamr.readClipboard()
     if (!text) return
-    setInput(input.slice(0, start) + text + input.slice(end))
-    restoreCaret(start + text.length)
+    const ed = editorRef.current
+    if (ed) {
+      ed.chain().focus().insertContent(text).run()
+    } else {
+      const { start, end } = inputMenu
+      setInput(input.slice(0, start) + text + input.slice(end))
+    }
   }
   const selectAllInput = (): void => {
     setInputMenu(null)
-    requestAnimationFrame(() => {
-      const el = inputRef.current
-      if (el) {
-        el.focus()
-        el.select()
-      }
-    })
+    const ed = editorRef.current
+    if (ed) {
+      ed.chain().focus().selectAll().run()
+    }
   }
 
   const switchMode = async (next: PermissionMode): Promise<void> => {
@@ -1348,7 +1379,7 @@ export default function Workspace({
                 touched={touched}
                 changed={changedPaths}
                 reload={treeReload}
-                onOpen={(p) => void openFile(p)}
+                onOpen={openFile}
               />
             </aside>
             <ResizeHandle
@@ -1379,7 +1410,7 @@ export default function Workspace({
                   touched={touched}
                   changed={changedPaths}
                   reload={treeReload}
-                  onOpen={(p) => void openFile(p)}
+                  onOpen={openFile}
                 />
               </div>
             </aside>
@@ -1387,12 +1418,14 @@ export default function Workspace({
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
+          <div className="relative flex-1 min-h-0">
           <div
             ref={scrollRef}
+            onScroll={handleMessagesScroll}
             // Compact (narrow) view: let bubbles fill the width and trim the
             // side padding, so a cramped column isn't wasting space on a cap.
             style={{ '--msg-max': compactBar ? '100%' : '85%' } as React.CSSProperties}
-            className={`flex-1 space-y-3 overflow-y-auto py-4 ${compactBar ? 'px-2' : 'px-4'}`}
+            className={`h-full space-y-3 overflow-y-auto py-4 ${compactBar ? 'px-2' : 'px-4'}`}
           >
             {items.length === 0 && (
               <p className="mt-24 text-center text-sm text-zinc-500">
@@ -1405,7 +1438,7 @@ export default function Workspace({
                   key={r.id}
                   tools={r.tools}
                   onDecide={decide}
-                  onOpenFile={(p) => void openFile(p)}
+                  onOpenFile={openFile}
                   cwd={cwd}
                 />
               ) : (
@@ -1442,12 +1475,16 @@ export default function Workspace({
                   <TranscriptItem
                     item={r.item}
                     onDecide={decide}
-                    onOpenFile={(p) => void openFile(p)}
+                    onOpenFile={openFile}
                     cwd={cwd}
                   />
                 </div>
               ),
             )}
+          </div>
+          {userScrolledUp && (
+            <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-zinc-950 to-transparent" />
+          )}
           </div>
 
           {busy && (
@@ -1659,39 +1696,29 @@ export default function Workspace({
                   ))}
                 </div>
               )}
-              {mdPreview && input.trim() ? (
-                <div
-                  onClick={() => {
-                    setMdPreview(false)
-                    inputRef.current?.focus()
-                  }}
-                  title="click to edit"
-                  className="max-h-[260px] min-h-[52px] flex-1 cursor-text overflow-y-auto rounded border border-zinc-700 bg-zinc-900 px-3 py-2"
-                >
-                  <Markdown text={input} />
-                </div>
-              ) : (
-                <textarea
-                  ref={inputRef}
-                  value={input}
-                  onChange={(e) => {
-                  setInput(e.target.value)
+              <Composer
+                value={input}
+                onChange={(v) => {
+                  setInput(v)
                   setSlashSel(0)
                   setSlashClosed(false)
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault()
-                  const el = e.currentTarget
                   // The composer is at the bottom of the window, so a menu drawn
                   // downward from the cursor overflows off-screen — clamp both
                   // axes to keep the whole menu inside the viewport.
                   const MENU_W = 160
                   const MENU_H = 140
+                  const ed = editorRef.current
+                  const sel = ed?.state.selection
+                  const from = sel?.from ?? 0
+                  const to = sel?.to ?? 0
                   setInputMenu({
                     x: Math.max(8, Math.min(e.clientX, window.innerWidth - MENU_W - 8)),
                     y: Math.max(8, Math.min(e.clientY, window.innerHeight - MENU_H - 8)),
-                    start: el.selectionStart ?? 0,
-                    end: el.selectionEnd ?? 0,
+                    start: from,
+                    end: to,
                   })
                 }}
                 onPaste={(e) => {
@@ -1730,12 +1757,15 @@ export default function Workspace({
                       return
                     }
                   }
+                  // Enter always sends the message. Shift+Enter inside a list
+                  // creates a new bullet (handled inside TipTap's
+                  // handleKeyDown, which runs before the default hard-break
+                  // keymap); Shift+Enter elsewhere is a plain line break.
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
                     void sendPrompt()
                   }
                 }}
-                rows={1}
                 placeholder={
                   !connected
                     ? 'Starting agent…'
@@ -1744,30 +1774,12 @@ export default function Workspace({
                       : 'Ask the agent… (Enter to send, Shift+Enter for newline)'
                 }
                 disabled={!connected}
-                className="max-h-[260px] flex-1 resize-none overflow-y-auto rounded border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm outline-none focus:border-zinc-500 disabled:opacity-50"
+                inputRef={inputRef}
+                onEditorReady={(ed) => {
+                  editorRef.current = ed
+                }}
+                className="max-h-[260px] min-h-[52px]"
               />
-              )}
-              <button
-                onClick={() => setMdPreview((p) => !p)}
-                disabled={!input.trim()}
-                title={mdPreview ? 'edit the message' : 'preview as markdown'}
-                className={`flex items-center justify-center rounded px-2.5 disabled:opacity-30 ${
-                  mdPreview ? 'bg-zinc-700 text-sky-400' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
-                }`}
-              >
-                {mdPreview ? (
-                  // editing pencil
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
-                  </svg>
-                ) : (
-                  // markdown mark
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <rect x="3" y="5" width="18" height="14" rx="2" />
-                    <path d="M7 15V9l3 3 3-3v6M17.5 9v6M15 12.5l2.5 2.5 2.5-2.5" />
-                  </svg>
-                )}
-              </button>
               <button
                 onClick={() => void sendPrompt()}
                 disabled={!connected || (input.trim() === '' && attachments.length === 0)}
