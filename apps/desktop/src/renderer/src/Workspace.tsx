@@ -12,6 +12,8 @@ import { Composer } from './components/Composer'
 
 import { ResizeHandle, RowResizeHandle, BarMenuItem } from './components/ResizeHandle'
 import { SearchModal, HistoryModal } from './components/Modals'
+import { CheckpointTimeline } from './components/CheckpointTimeline'
+import { CheckpointDiffModal } from './components/CheckpointDiffModal'
 import type { Attachment, InferenceStats, Item, ToolItem, SlashCmd, ChatEntry } from './workspace/types'
 import { uid, reseatIds, SLASH_COMMANDS, MAX_ATTACHMENTS } from './workspace/types'
 import { basename, clamp, normPath, isAbsPath, fileToAttachment } from './workspace/helpers'
@@ -55,6 +57,23 @@ export default function Workspace({
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [dragOver, setDragOver] = useState(false)
   const dragDepth = useRef(0)
+  // Session ID for checkpoint tracking (persists across agent restarts)
+  const sessionIdRef = useRef<string>(crypto.randomUUID())
+  const sessionId = sessionIdRef.current
+  // Checkpoint state
+  const [checkpointCount, setCheckpointCount] = useState(0)
+  const [showCheckpoints, setShowCheckpoints] = useState(false)
+  const [checkpointDiff, setCheckpointDiff] = useState<{ ref: string; diff: string } | null>(null)
+  // Refresh checkpoint list after turn completes
+  const refreshCheckpointList = useCallback(async () => {
+    try {
+      const checkpoints = await window.codehamr.checkpointList(cwd, sessionId)
+      setCheckpointCount(checkpoints.length)
+    } catch (err) {
+      console.warn('Failed to refresh checkpoint list:', err)
+      setCheckpointCount(0)
+    }
+  }, [cwd, sessionId])
   // Targeted tree reload: which directories to re-fetch (only loaded ones are
   // acted on). nonce makes each signal distinct even if the dirs repeat.
   const [treeReload, setTreeReload] = useState<{ dirs: string[]; nonce: number } | null>(null)
@@ -154,6 +173,7 @@ export default function Workspace({
     userScrolledUp,
     userScrolledUpRef,
     handleMessagesScroll,
+    scrollToBottom,
     scrollToMessage,
   } = useScrollManager()
 
@@ -168,6 +188,30 @@ export default function Workspace({
   modeRef.current = mode
 
   const { toast, showToast } = useToast()
+
+  // Revert to a checkpoint: confirmation + git stash pop + UI refresh
+  const handleRevert = useCallback(async (ref: string) => {
+    if (!confirm(`Revert to checkpoint ${ref.slice(0, 8)}?\n\nThis will discard all changes made after this checkpoint.`)) {
+      return
+    }
+    try {
+      const success = await window.codehamr.checkpointRevert(cwd, ref)
+      if (success) {
+        showToast('Reverted to checkpoint')
+        setCheckpointDiff(null)
+        // Refresh git status and file tree
+        refreshGitStat()
+        setTreeReload({ dirs: [cwd], nonce: Date.now() })
+        // Refresh checkpoint list (older checkpoints may be gone)
+        await refreshCheckpointList()
+      } else {
+        showToast('Failed to revert')
+      }
+    } catch (err) {
+      console.error('Revert failed:', err)
+      showToast('Revert failed')
+    }
+  }, [cwd, showToast, refreshGitStat, refreshCheckpointList])
 
 
 
@@ -192,9 +236,9 @@ export default function Workspace({
 
   useEffect(() => {
     if (!userScrolledUpRef.current) {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+      scrollToBottom()
     }
-  }, [items])
+  }, [items, scrollToBottom, userScrolledUpRef])
 
   // Composer auto-grow is handled inside the Composer component (TipTap).
 
@@ -275,6 +319,7 @@ export default function Workspace({
     setRunningTool,
     setLastInference,
     lastGenMsRef,
+    onTurnComplete: refreshCheckpointList,
   })
 
   // Subscribe to this workspace's slice of the event streams.
@@ -327,6 +372,7 @@ export default function Workspace({
     switchMode,
   } = useAgentCommands({
     cwd,
+    sessionId,
     busy,
     ask,
     activeModel,
@@ -735,6 +781,27 @@ export default function Workspace({
               )}
             </div>
           )}
+          {checkpointCount > 0 && (
+            <button
+              onClick={() => setShowCheckpoints(true)}
+              title="View checkpoints"
+              className="flex items-center gap-1 rounded border border-zinc-700 bg-zinc-900/50 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className="h-3 w-3"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
+              {checkpointCount}
+            </button>
+          )}
           {pinned.length > 0 && (
             <button
               onClick={() => setPinsOpen((o) => !o)}
@@ -893,6 +960,7 @@ export default function Workspace({
                     item={r.item}
                     onDecide={decide}
                     onOpenFile={openFile}
+                    onOpenUrl={(url) => requestAgentPreview(undefined, url)}
                     cwd={cwd}
                   />
                 </div>
@@ -1270,6 +1338,51 @@ export default function Workspace({
           onSwitch={(id) => void switchToChat(id)}
           onDelete={(id) => void removeChat(id)}
           onClose={() => setHistoryOpen(false)}
+        />
+      )}
+
+      {showCheckpoints && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowCheckpoints(false)}>
+          <div className="max-h-[80vh] w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+              <h2 className="text-sm font-medium text-zinc-200">Checkpoints</h2>
+              <button
+                onClick={() => setShowCheckpoints(false)}
+                className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+            <CheckpointTimeline
+              cwd={cwd}
+              sessionId={sessionId}
+              onRevert={(ref) => void handleRevert(ref)}
+              onPreview={async (ref) => {
+                try {
+                  const diff = await window.codehamr.checkpointDiff(cwd, ref)
+                  if (diff) {
+                    setCheckpointDiff({ ref, diff })
+                    setShowCheckpoints(false)
+                  }
+                } catch (err) {
+                  console.error('Failed to load diff:', err)
+                  showToast('Failed to load diff')
+                }
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {checkpointDiff && (
+        <CheckpointDiffModal
+          diff={checkpointDiff.diff}
+          ref={checkpointDiff.ref}
+          onClose={() => setCheckpointDiff(null)}
+          onRevert={() => void handleRevert(checkpointDiff.ref)}
         />
       )}
 

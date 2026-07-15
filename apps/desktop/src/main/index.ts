@@ -532,6 +532,128 @@ async function gitBranch(cwd: string): Promise<string | null> {
   return sha || null
 }
 
+// ---------------------------------------------------------------------------
+// Session checkpoints: git stash-based snapshots before each agent turn.
+// Stashes are separate from commit history, keeping `git log` clean.
+// ---------------------------------------------------------------------------
+
+export interface Checkpoint {
+  ref: string // stash@{N}
+  timestamp: number // unix ms
+  sessionId: string
+  filesChanged: number
+}
+
+async function gitCreateCheckpoint(
+  cwd: string,
+  sessionId: string,
+): Promise<string | null> {
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+      })
+      return stdout.trim()
+    } catch {
+      return null
+    }
+  }
+  // Check if there are any changes to stash.
+  const status = await run(['status', '--porcelain'])
+  if (status === null) return null // not a repo / git missing
+  if (status === '') return null // no changes
+
+  const timestamp = Date.now()
+  const message = `checkpoint:${sessionId}:${timestamp}`
+  const ref = await run(['stash', 'push', '-m', message, '--include-untracked'])
+  if (ref === null) return null
+  return 'stash@{0}'
+}
+
+async function gitListCheckpoints(
+  cwd: string,
+  sessionId: string,
+): Promise<Checkpoint[]> {
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  const out = await run(['stash', 'list', '--format=%gD|%s|%aI'])
+  if (out === null) return []
+
+  const checkpoints: Checkpoint[] = []
+  const prefix = `checkpoint:${sessionId}:`
+
+  for (const line of out.split('\n').filter(Boolean)) {
+    const parts = line.split('|')
+    if (parts.length < 3) continue
+
+    const ref = parts[0]
+    const subject = parts[1]
+    if (!subject.startsWith(prefix)) continue
+
+    const timestamp = Number(subject.slice(prefix.length))
+    if (isNaN(timestamp)) continue
+
+    const numstat = await run(['stash', 'show', '--numstat', ref])
+    const filesChanged = numstat ? numstat.split('\n').filter(Boolean).length : 0
+
+    checkpoints.push({ ref, timestamp, sessionId, filesChanged })
+  }
+
+  return checkpoints.sort((a, b) => b.timestamp - a.timestamp)
+}
+
+async function gitRevertToCheckpoint(cwd: string, stashRef: string): Promise<boolean> {
+  const run = async (args: string[]): Promise<boolean> => {
+    try {
+      await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 10000,
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const applied = await run(['stash', 'apply', stashRef])
+  if (!applied) return false
+
+  const match = /stash@\{(\d+)\}/.exec(stashRef)
+  if (!match) return true
+
+  const targetIndex = Number(match[1])
+  for (let i = targetIndex - 1; i >= 0; i--) {
+    await run(['stash', 'drop', `stash@{${i}}`])
+  }
+  return true
+}
+
+async function gitCheckpointDiff(cwd: string, stashRef: string): Promise<string | null> {
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  return await run(['stash', 'show', '-p', stashRef])
+}
+
 const CONFIG_HEADER =
   '# codehamr configuration — edited via Anvil\n' +
   '# key: ${MY_KEY} expands the env var at runtime, keeping secrets off disk.\n\n'
@@ -660,6 +782,24 @@ function wireIpc(): void {
   )
   ipcMain.handle('git:status', async (_evt, cwd: string) => gitStatus(cwd))
   ipcMain.handle('git:branch', async (_evt, cwd: string) => gitBranch(cwd))
+
+  // Session checkpoints: git stash-based snapshots before each agent turn.
+  ipcMain.handle(
+    'checkpoint:create',
+    async (_evt, cwd: string, sessionId: string) => gitCreateCheckpoint(cwd, sessionId),
+  )
+  ipcMain.handle(
+    'checkpoint:list',
+    async (_evt, cwd: string, sessionId: string) => gitListCheckpoints(cwd, sessionId),
+  )
+  ipcMain.handle(
+    'checkpoint:revert',
+    async (_evt, cwd: string, stashRef: string) => gitRevertToCheckpoint(cwd, stashRef),
+  )
+  ipcMain.handle(
+    'checkpoint:diff',
+    async (_evt, cwd: string, stashRef: string) => gitCheckpointDiff(cwd, stashRef),
+  )
 
   // System clipboard access for the composer's right-click menu. Routed
   // through main because the sandboxed preload can't import the clipboard

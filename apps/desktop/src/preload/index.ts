@@ -77,9 +77,23 @@ const api = {
     cwd: string,
   ): Promise<{ modified: string[]; added: string[]; untracked: string[] } | null> =>
     ipcRenderer.invoke('git:status', cwd),
+  /** Session checkpoints: git stash-based snapshots before each agent turn. */
+  checkpointCreate: (cwd: string, sessionId: string): Promise<string | null> =>
+    ipcRenderer.invoke('checkpoint:create', cwd, sessionId),
+  checkpointList: (
+    cwd: string,
+    sessionId: string,
+  ): Promise<{ ref: string; timestamp: number; sessionId: string; filesChanged: number }[]> =>
+    ipcRenderer.invoke('checkpoint:list', cwd, sessionId),
+  checkpointRevert: (cwd: string, stashRef: string): Promise<boolean> =>
+    ipcRenderer.invoke('checkpoint:revert', cwd, stashRef),
+  checkpointDiff: (cwd: string, stashRef: string): Promise<string | null> =>
+    ipcRenderer.invoke('checkpoint:diff', cwd, stashRef),
   /** System clipboard, for the composer's right-click menu. */
   readClipboard: (): Promise<string> => ipcRenderer.invoke('clipboard:read'),
   writeClipboard: (text: string): Promise<void> => ipcRenderer.invoke('clipboard:write', text),
+  /** Open a URL in the user's default system browser. */
+  openExternal: (url: string): Promise<void> => ipcRenderer.invoke('browser:openExternal', url),
   getMode: (cwd: string): Promise<PermissionMode> => ipcRenderer.invoke('mode:get', cwd),
   setMode: (cwd: string, mode: PermissionMode): Promise<void> =>
     ipcRenderer.invoke('mode:set', cwd, mode),

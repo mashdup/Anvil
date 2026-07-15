@@ -35,6 +35,7 @@ export function useAgentEvents({
   setRunningTool,
   setLastInference,
   lastGenMsRef,
+  onTurnComplete,
 }: {
   cwd: string
   modeRef: React.MutableRefObject<PermissionMode>
@@ -60,6 +61,7 @@ export function useAgentEvents({
   setRunningTool: (v: string) => void
   setLastInference: (v: InferenceStats | null) => void
   lastGenMsRef: React.MutableRefObject<number | null>
+  onTurnComplete?: () => void
 }): (event: AgentEvent) => void {
   return useCallback(
     (event: AgentEvent) => {
@@ -218,6 +220,8 @@ export function useAgentEvents({
             setLastInference({ ...event.usage, durationMs: lastGenMsRef.current ?? undefined })
           genStartRef.current = null
           endTurn()
+          // Refresh checkpoint list after turn completes
+          if (onTurnComplete) onTurnComplete()
           break
         case 'error':
           endTurn()
@@ -242,6 +246,6 @@ export function useAgentEvents({
           break
       }
     },
-    [cwd, modeRef, showToast, setConnected, setActiveModel, setModels, setMode, resetSessionStats, endTurn, push, reloadDirs, setItems, requestAgentPreview, setAsk, setPhase, genStartRef, genCharsRef, prefillMsRef, roundStartRef, setStep, setStreamMeter, setRunningTool, setLastInference, lastGenMsRef],
+    [cwd, modeRef, showToast, setConnected, setActiveModel, setModels, setMode, resetSessionStats, endTurn, push, reloadDirs, setItems, requestAgentPreview, setAsk, setPhase, genStartRef, genCharsRef, prefillMsRef, roundStartRef, setStep, setStreamMeter, setRunningTool, setLastInference, lastGenMsRef, onTurnComplete],
   )
 }

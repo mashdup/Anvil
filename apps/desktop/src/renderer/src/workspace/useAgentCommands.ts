@@ -7,6 +7,7 @@ import { inlineFiles } from './helpers'
 
 interface AgentCommandDeps {
   cwd: string
+  sessionId: string
   busy: boolean
   ask: { callId: string; prompt: string; options: string[] } | null
   activeModel: string
@@ -25,6 +26,8 @@ interface AgentCommandDeps {
   roundStartRef: React.MutableRefObject<number | null>
   modeRef: React.MutableRefObject<PermissionMode>
   push: (item: Item) => void
+  /** Refresh checkpoint list after turn completes */
+  onTurnComplete?: () => void
 }
 
 /**
@@ -35,6 +38,7 @@ interface AgentCommandDeps {
  */
 export function useAgentCommands({
   cwd,
+  sessionId,
   busy,
   ask,
   activeModel,
@@ -53,6 +57,7 @@ export function useAgentCommands({
   roundStartRef,
   modeRef,
   push,
+  onTurnComplete,
 }: AgentCommandDeps): {
   dispatchPrompt: (text: string, atts: Attachment[]) => Promise<void>
   cancelTurn: () => Promise<void>
@@ -83,6 +88,16 @@ export function useAgentCommands({
         images: images.length ? images.map((a) => `data:${a.mime};base64,${a.dataB64}`) : undefined,
         files: files.length ? files.map((f) => f.name) : undefined,
       })
+      // Create a checkpoint before sending the prompt. This captures the current
+      // state so users can revert if the agent makes unwanted changes. Failures
+      // are non-fatal (e.g., not a git repo) — we don't block the agent turn.
+      try {
+        await window.codehamr.checkpointCreate(cwd, sessionId)
+      } catch (err) {
+        // Checkpoint creation failed — likely not a git repo or git not available.
+        // Log but don't block the prompt.
+        console.warn('Failed to create checkpoint:', err)
+      }
       await window.codehamr.send(cwd, {
         v: PROTOCOL_VERSION,
         type: 'prompt',
@@ -90,7 +105,7 @@ export function useAgentCommands({
         images: images.length ? images.map(({ mime, dataB64 }) => ({ mime, dataB64 })) : undefined,
       })
     },
-    [cwd, push],
+    [cwd, sessionId, push],
   )
 
   const cancelTurn = async (): Promise<void> => {

@@ -1,4 +1,4 @@
-import { memo, useState } from 'react'
+import { memo, useState, useRef, useEffect } from 'react'
 import type { Decide, Item } from '../workspace/types'
 import { Markdown } from './Markdown'
 import { ToolCard } from './ToolCard'
@@ -7,11 +7,13 @@ export const TranscriptItem = memo(function TranscriptItem({
   item,
   onDecide,
   onOpenFile,
+  onOpenUrl,
   cwd,
 }: {
   item: Item
   onDecide: Decide
   onOpenFile: (path: string) => void
+  onOpenUrl?: (url: string) => void
   cwd?: string
 }): React.JSX.Element {
   switch (item.kind) {
@@ -37,13 +39,13 @@ export const TranscriptItem = memo(function TranscriptItem({
               ))}
             </div>
           )}
-          {item.text && <Markdown text={item.text} />}
+          {item.text && <Markdown text={item.text} onOpenUrl={onOpenUrl} />}
         </div>
       )
     case 'assistant':
       return (
         <div className="w-fit max-w-[var(--msg-max,85%)] rounded-lg bg-zinc-900 px-3 py-2 text-sm">
-          <Markdown text={item.text} />
+          <Markdown text={item.text} onOpenUrl={onOpenUrl} />
           {item.streaming && <span className="animate-pulse text-zinc-500"> ▍</span>}
         </div>
       )
@@ -74,7 +76,16 @@ function ReasoningCard({
   item: Extract<Item, { kind: 'reasoning' }>
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const expanded = item.streaming || open
+
+  // Auto-scroll while streaming
+  useEffect(() => {
+    if (item.streaming && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [item.text, item.streaming])
+
   return (
     <div className="max-w-[var(--msg-max,85%)] rounded-lg border border-zinc-800/60 bg-zinc-900/40 text-xs text-zinc-500">
       <button
@@ -87,7 +98,7 @@ function ReasoningCard({
         {!expanded && <span className="truncate">{item.text.slice(0, 120)}</span>}
       </button>
       {expanded && (
-        <div className="max-h-48 overflow-y-auto border-t border-zinc-800/60 px-3 py-2 whitespace-pre-wrap">
+        <div ref={scrollRef} className="max-h-48 overflow-y-auto border-t border-zinc-800/60 px-3 py-2 whitespace-pre-wrap">
           {item.text}
           {item.streaming && <span className="animate-pulse"> ▍</span>}
         </div>

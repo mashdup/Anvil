@@ -235,6 +235,18 @@ export function BrowserPane({
           Go
         </button>
         <button
+          onClick={() => {
+            const url = wvRef.current?.getURL() || bar
+            if (url && !isLanding(url)) {
+              void window.codehamr.openExternal(url)
+            }
+          }}
+          title="open in external browser"
+          className="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800"
+        >
+          ↗
+        </button>
+        <button
           onClick={onClose}
           title="close browser (preview panel)"
           className="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
