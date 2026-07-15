@@ -19,6 +19,14 @@ import { useElementWidth } from './workspace/hooks'
 import { useGitStatus } from './workspace/useGitStatus'
 import { usePreviewPanels } from './workspace/usePreviewPanels'
 import { useAgentCommands } from './workspace/useAgentCommands'
+import { useAgentEvents } from './workspace/useAgentEvents'
+import { useChatHistory } from './workspace/useChatHistory'
+import { useToast } from './workspace/useToast'
+import { useInputMenu } from './workspace/useInputMenu'
+import { useMessageMenu } from './workspace/useMessageMenu'
+import { useScrollManager } from './workspace/useScrollManager'
+import { useSlashCommands } from './workspace/useSlashCommands'
+import { useSearch } from './workspace/useSearch'
 import { TREE_MIN, TREE_MAX, PREVIEW_MIN } from './workspace/layout'
 
 /**
@@ -103,8 +111,6 @@ export default function Workspace({
   const [ask, setAsk] = useState<{ callId: string; prompt: string; options: string[] } | null>(
     null,
   )
-  const [searchOpen, setSearchOpen] = useState(false)
-  const [query, setQuery] = useState('')
   // Right-click context menu on user/assistant messages (copy / pin).
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; id: string } | null>(null)
   // Right-click context menu on the composer input (cut / copy / paste). The
@@ -134,22 +140,13 @@ export default function Workspace({
   const genCharsRef = useRef(0) // chars streamed in the current generation (≈ tokens×4)
   const prefillMsRef = useRef<number | null>(null) // time-to-first-token of the current round
   const roundStartRef = useRef<number | null>(null) // when the current round's wait began
-  const scrollRef = useRef<HTMLDivElement>(null)
-  // True while the user has manually scrolled away from the bottom. While true,
-  // auto-scroll-on-content is suppressed and a gradient overlay hints at new
-  // content below. Resets whenever the user scrolls back to the bottom.
-  const [userScrolledUp, setUserScrolledUp] = useState(false)
-  const userScrolledUpRef = useRef(false) // mirror for hot-path reads in effects
-  const AT_BOTTOM_THRESHOLD = 20 // px from true bottom to consider "at bottom"
-
-  const handleMessagesScroll = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-    const atBottom = distFromBottom < AT_BOTTOM_THRESHOLD
-    userScrolledUpRef.current = !atBottom
-    setUserScrolledUp(!atBottom)
-  }, [])
+  const {
+    scrollRef,
+    userScrolledUp,
+    userScrolledUpRef,
+    handleMessagesScroll,
+    scrollToMessage,
+  } = useScrollManager()
 
 
   const push = useCallback((item: Item) => {
@@ -181,231 +178,11 @@ export default function Workspace({
     )
   }, [])
 
-  // Transient toast for ephemeral status (session resume, etc.) that doesn't
-  // belong in the permanent chat log.
-  const [toast, setToast] = useState<string | null>(null)
-  const toastTimer = useRef<number | null>(null)
-  const showToast = useCallback((msg: string) => {
-    setToast(msg)
-    if (toastTimer.current) window.clearTimeout(toastTimer.current)
-    toastTimer.current = window.setTimeout(() => setToast(null), 3500)
-  }, [])
-  useEffect(() => () => window.clearTimeout(toastTimer.current ?? undefined), [])
+  const { toast, showToast } = useToast()
 
-  // Fold agent events into the transcript.
-  const onEvent = useCallback(
-    (event: AgentEvent) => {
-      switch (event.type) {
-        case 'ready':
-          setConnected(true)
-          setActiveModel(event.activeModel)
-          setModels(event.models)
-          if (modeRef.current !== (event.mode ?? 'ask')) {
-            void window.codehamr.send(cwd, {
-              v: PROTOCOL_VERSION,
-              type: 'set_mode',
-              mode: modeRef.current,
-            })
-          }
-          if (event.historyLen) {
-            showToast(`Resumed session — the model remembers ${event.historyLen} messages`)
-          }
-          break
-        case 'cleared':
-          setItems([])
-          resetSessionStats()
-          break
-        case 'compacted':
-          endTurn()
-          push({
-            kind: 'notice',
-            id: uid(),
-            text:
-              event.historyLen === 0
-                ? 'Nothing to compact yet.'
-                : `Context compacted — ${event.message ?? 'the agent’s memory was summarized'}. Your visible chat is unchanged.`,
-            tone: 'info',
-          })
-          break
-        case 'mode':
-          setMode(event.mode) // the agent is the source of truth
-          break
-        case 'file_diff': {
-          // Reload just the edited file's directory (the watcher also catches
-          // it, but this is instant).
-          const abs = isAbsPath(event.path) ? event.path : `${cwd}/${event.path}`
-          reloadDirs([abs.replace(/[\\/][^\\/]*$/, '')])
-          setItems((prev) =>
-            prev.map((it) =>
-              it.kind === 'tool' && it.id === event.callId
-                ? { ...it, diff: { path: event.path, unifiedDiff: event.unifiedDiff } }
-                : it,
-            ),
-          )
-          break
-        }
-        case 'preview':
-          // Agent-requested preview (preview_file / preview_url tools); the
-          // preview hook opens the panel in a follow-up effect.
-          requestAgentPreview(event.path, event.url)
-          break
-        case 'ask_user':
-          // Agent is blocked on a user selection: surface the options above the
-          // composer. The tool card still renders as running; answering it
-          // sends an ask_user_response and unblocks the turn.
-          setAsk({ callId: event.callId, prompt: event.prompt, options: event.options })
-          break
-        case 'reasoning_delta':
-          setPhase('thinking')
-          setItems((prev) => {
-            const last = prev[prev.length - 1]
-            if (last?.kind === 'reasoning' && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, text: last.text + event.text }]
-            }
-            return [...prev, { kind: 'reasoning', id: uid(), text: event.text, streaming: true }]
-          })
-          break
-        case 'assistant_delta':
-          if (genStartRef.current === null) {
-            genStartRef.current = Date.now() // first content token
-            genCharsRef.current = 0
-            setStep((s) => s + 1) // a new agentic round's response has begun
-            if (roundStartRef.current !== null) prefillMsRef.current = Date.now() - roundStartRef.current
-          }
-          genCharsRef.current += event.text.length
-          setPhase('streaming')
-          setItems((prev) => {
-            // Answer tokens end the thinking display: collapse the reasoning
-            // bubble to its summary line.
-            const closed = prev.map((it) =>
-              it.kind === 'reasoning' && it.streaming ? { ...it, streaming: false } : it,
-            )
-            const last = closed[closed.length - 1]
-            if (last?.kind === 'assistant' && last.streaming) {
-              return [...closed.slice(0, -1), { ...last, text: last.text + event.text }]
-            }
-            return [...closed, { kind: 'assistant', id: uid(), text: event.text, streaming: true }]
-          })
-          break
-        case 'assistant_done':
-          if (genStartRef.current !== null) {
-            lastGenMsRef.current = Date.now() - genStartRef.current
-            genStartRef.current = null
-          }
-          setStreamMeter(null)
-          setItems((prev) =>
-            prev.map((it) =>
-              (it.kind === 'assistant' || it.kind === 'reasoning') && it.streaming
-                ? { ...it, streaming: false }
-                : it,
-            ),
-          )
-          break
-        case 'tool_call':
-          setPhase('tool')
-          setRunningTool(toolLabel(event.name, event.args))
-          setItems((prev) => [
-            ...prev,
-            {
-              kind: 'tool',
-              id: event.callId,
-              name: event.name,
-              args: event.args,
-              status: event.needsApproval ? 'pending_approval' : 'running',
-            },
-          ])
-          break
-        case 'tool_output_delta':
-          setItems((prev) =>
-            prev.map((it) =>
-              it.kind === 'tool' && it.id === event.callId
-                ? { ...it, liveOutput: (it.liveOutput ?? '') + event.text }
-                : it,
-            ),
-          )
-          break
-        case 'tool_result':
-          // Round-trip continues: next LLM round follows, so back to waiting.
-          setPhase('waiting')
-          setRunningTool('')
-          roundStartRef.current = Date.now() // the next round's wait (prefill) begins now
-          setItems((prev) =>
-            prev.map((it) =>
-              it.kind === 'tool' && it.id === event.callId
-                ? {
-                    ...it,
-                    status: event.ok ? 'done' : 'failed',
-                    output: event.output,
-                    liveOutput: undefined,
-                    background: event.background ?? false,
-                  }
-                : it,
-            ),
-          )
-          break
-        case 'turn_done':
-          // Keep the last stat when a turn ends without usage (cancel, or an
-          // endpoint that doesn't report it) — only overwrite on a real number.
-          if (event.usage)
-            setLastInference({ ...event.usage, durationMs: lastGenMsRef.current ?? undefined })
-          genStartRef.current = null
-          endTurn()
-          break
-        case 'error':
-          endTurn()
-          setItems((prev) => [
-            ...prev,
-            { kind: 'notice', id: uid(), text: event.message, tone: 'error' },
-          ])
-          break
-        case 'models':
-          setActiveModel(event.activeModel)
-          setModels(event.models)
-          break
-        case 'log':
-          push({
-            kind: 'notice',
-            id: uid(),
-            text: event.message,
-            tone: event.level === 'warn' || event.level === 'error' ? 'error' : 'info',
-          })
-          break
-        default:
-          break
-      }
-    },
-    [endTurn, push, showToast, reloadDirs, requestAgentPreview, cwd],
-  )
 
-  // Subscribe to this workspace's slice of the event streams.
-  useEffect(() => {
-    const offEvent = window.codehamr.onEvent((p) => {
-      if (p.cwd === cwd) onEvent(p.event)
-    })
-    // Agent stderr / non-protocol stdout: a Go panic or startup failure lands
-    // here. Surfacing it is the difference between a debuggable crash and a
-    // silent "agent exited".
-    const offNoise = window.codehamr.onNoise((p) => {
-      if (p.cwd === cwd) push({ kind: 'notice', id: uid(), text: p.line, tone: 'info' })
-    })
-    const offExit = window.codehamr.onExit(({ cwd: eCwd, code, signal }) => {
-      if (eCwd !== cwd) return
-      setConnected(false)
-      endTurn()
-      const why = code !== null ? `code ${code}` : signal ? `signal ${signal}` : 'reason unknown'
-      push({
-        kind: 'notice',
-        id: uid(),
-        text: `agent exited (${why}) — see the lines above for its last words`,
-        tone: 'error',
-      })
-    })
-    return () => {
-      offEvent()
-      offNoise()
-      offExit()
-    }
-  }, [cwd, onEvent, endTurn, push])
+
+
 
   // Filesystem changes in this workspace (agent bash, external edits) refresh
   // only the affected directories in the tree.
@@ -486,32 +263,6 @@ export default function Workspace({
     return () => clearTimeout(t)
   }, [items, cwd])
 
-  // ---------------------------------------------------------------------
-  // Chat history: New chat archives the current conversation; History
-  // switches between archived ones (agent restarts with that session).
-  // ---------------------------------------------------------------------
-  const [chats, setChats] = useState<ChatEntry[]>([])
-  const [historyOpen, setHistoryOpen] = useState(false)
-
-  /** Force-write the transcript now — the autosave debounce may be pending. */
-  const flushTranscript = async (): Promise<void> => {
-    if (loadedRef.current) await window.codehamr.writeTranscript(cwd, items)
-  }
-
-  const loadChats = async (): Promise<void> => {
-    setChats(await window.codehamr.listChats(cwd))
-  }
-
-  const loadTranscriptFromDisk = async (): Promise<void> => {
-    const saved = (await window.codehamr.readTranscript(cwd)) as Item[] | null
-    if (Array.isArray(saved)) {
-      reseatIds(saved)
-      setItems(saved.map((it) => ('streaming' in it ? { ...it, streaming: false } : it)))
-    } else {
-      setItems([])
-    }
-  }
-
   // Token/context readouts describe the *active* session's last turn, so they
   // must be dropped when the session changes — otherwise the stale count and
   // context-window bar carry over into a freshly opened or switched-to chat.
@@ -522,34 +273,91 @@ export default function Workspace({
     lastGenMsRef.current = null
   }
 
-  const newChat = async (): Promise<void> => {
-    if (!connected || busy) return
-    setHistoryOpen(false)
-    await flushTranscript()
-    setConnected(false)
-    await window.codehamr.newChatSession(cwd) // archives the current pair
-    setItems([])
-    setQueue([])
-    resetSessionStats()
-    await window.codehamr.startAgent(cwd)
-  }
+  // ---------------------------------------------------------------------
+  // Chat history: New chat archives the current conversation; History
+  // switches between archived ones (agent restarts with that session).
+  // ---------------------------------------------------------------------
+  const {
+    chats,
+    historyOpen,
+    setHistoryOpen,
+    flushTranscript,
+    loadChats,
+    loadTranscriptFromDisk,
+    newChat,
+    switchToChat,
+    removeChat,
+  } = useChatHistory({
+    cwd,
+    items,
+    setItems,
+    setConnected,
+    setQueue,
+    resetSessionStats,
+    connected,
+    busy,
+    loadedRef,
+  })
 
-  const switchToChat = async (id: string): Promise<void> => {
-    setHistoryOpen(false)
-    if (busy || chats.find((c) => c.id === id)?.current) return
-    await flushTranscript()
-    setConnected(false)
-    await window.codehamr.switchChat(cwd, id)
-    await loadTranscriptFromDisk()
-    setQueue([])
-    resetSessionStats()
-    await window.codehamr.startAgent(cwd)
-  }
+  // Fold agent events into the transcript.
+  const onEvent = useAgentEvents({
+    cwd,
+    modeRef,
+    showToast,
+    setConnected,
+    setActiveModel,
+    setModels,
+    setMode,
+    resetSessionStats,
+    endTurn,
+    push,
+    reloadDirs,
+    setItems,
+    requestAgentPreview,
+    setAsk,
+    setPhase,
+    genStartRef,
+    genCharsRef,
+    prefillMsRef,
+    roundStartRef,
+    setStep,
+    setStreamMeter,
+    setRunningTool,
+    setLastInference,
+    lastGenMsRef,
+  })
 
-  const removeChat = async (id: string): Promise<void> => {
-    await window.codehamr.deleteChat(cwd, id)
-    await loadChats()
-  }
+  // Subscribe to this workspace's slice of the event streams.
+  useEffect(() => {
+    const offEvent = window.codehamr.onEvent((p) => {
+      if (p.cwd === cwd) onEvent(p.event)
+    })
+    // Agent stderr / non-protocol stdout: a Go panic or startup failure lands
+    // here. Surfacing it is the difference between a debuggable crash and a
+    // silent "agent exited".
+    const offNoise = window.codehamr.onNoise((p) => {
+      if (p.cwd === cwd) push({ kind: 'notice', id: uid(), text: p.line, tone: 'info' })
+    })
+    const offExit = window.codehamr.onExit(({ cwd: eCwd, code, signal }) => {
+      if (eCwd !== cwd) return
+      setConnected(false)
+      endTurn()
+      const why = code !== null ? `code ${code}` : signal ? `signal ${signal}` : 'reason unknown'
+      push({
+        kind: 'notice',
+        id: uid(),
+        text: `agent exited (${why}) — see the lines above for its last words`,
+        tone: 'error',
+      })
+    })
+    return () => {
+      offEvent()
+      offNoise()
+      offExit()
+    }
+  }, [cwd, onEvent, endTurn, push])
+
+
 
   // Files the agent wrote/edited this session — emerald dots in the tree.
   const touched = useMemo(() => {
@@ -621,203 +429,62 @@ export default function Workspace({
     })
   }
 
-  // --- Composer right-click clipboard actions. Each works off the selection
-  // captured when the menu opened, then restores focus + caret. -------------
-  const restoreCaret = (pos: number): void => {
-    requestAnimationFrame(() => {
-      const el = inputRef.current
-      if (el) {
-        el.focus()
-        el.selectionStart = el.selectionEnd = pos
-      }
-    })
-  }
-  const copyInput = (): void => {
-    if (!inputMenu) return
-    const sel = input.slice(inputMenu.start, inputMenu.end)
-    if (sel) void window.codehamr.writeClipboard(sel)
-    setInputMenu(null)
-  }
-  const cutInput = (): void => {
-    if (!inputMenu) return
-    const { start, end } = inputMenu
-    const sel = input.slice(start, end)
-    if (sel) {
-      void window.codehamr.writeClipboard(sel)
-      setInput(input.slice(0, start) + input.slice(end))
-      restoreCaret(start)
-    }
-    setInputMenu(null)
-  }
-  const pasteInput = async (): Promise<void> => {
-    if (!inputMenu) return
-    const { start, end } = inputMenu
-    const text = await window.codehamr.readClipboard()
-    setInputMenu(null)
-    if (!text) return
-    setInput(input.slice(0, start) + text + input.slice(end))
-    restoreCaret(start + text.length)
-  }
-  const selectAllInput = (): void => {
-    setInputMenu(null)
-    requestAnimationFrame(() => {
-      const el = inputRef.current
-      if (el) {
-        el.focus()
-        el.select()
-      }
-    })
-  }
+  const {
+    restoreCaret,
+    copyInput,
+    cutInput,
+    pasteInput,
+    selectAllInput,
+  } = useInputMenu({
+    input,
+    setInput,
+    inputRef,
+    inputMenu,
+    setInputMenu,
+  })
 
-  // Run a slash command instead of sending a prompt. Only invoked for text
-  // whose first word is a known command (see sendPrompt), so ordinary messages
-  // that merely start with "/" (e.g. a path) still go through as prompts.
-  const runSlash = async (raw: string): Promise<void> => {
-    const [name, ...rest] = raw.trim().split(/\s+/)
-    const arg = rest.join(' ').trim()
-    switch (name) {
-      case '/compact':
-        if (!connected) return
-        if (busy) {
-          push({ kind: 'notice', id: uid(), text: 'Finish or stop the current turn before compacting.', tone: 'info' })
-          return
-        }
-        setBusy(true)
-        setPhase('waiting')
-        setTurnStart(Date.now())
-        setElapsed(0)
-        push({ kind: 'notice', id: uid(), text: 'Compacting the conversation…', tone: 'info' })
-        try {
-          await window.codehamr.send(cwd, { v: PROTOCOL_VERSION, type: 'compact' })
-        } catch (err) {
-          // A rejected send (e.g. the agent predates /compact — restart the
-          // app) must not leave the composer wedged on busy forever.
-          endTurn()
-          push({
-            kind: 'notice',
-            id: uid(),
-            text: `Couldn't start compaction: ${err instanceof Error ? err.message : String(err)}. If you just updated, fully restart the app.`,
-            tone: 'error',
-          })
-        }
-        return
-      case '/clear':
-        await window.codehamr.send(cwd, { v: PROTOCOL_VERSION, type: 'clear' })
-        return
-      case '/model':
-        if (!arg) {
-          push({
-            kind: 'notice',
-            id: uid(),
-            text: `Models: ${models.map((m) => m.name).join(', ') || '(none)'} · active: ${activeModel}. Use /model <name>.`,
-            tone: 'info',
-          })
-        } else if (models.some((m) => m.name === arg)) {
-          await window.codehamr.send(cwd, { v: PROTOCOL_VERSION, type: 'set_model', name: arg })
-        } else {
-          push({
-            kind: 'notice',
-            id: uid(),
-            text: `Unknown model "${arg}" — available: ${models.map((m) => m.name).join(', ')}`,
-            tone: 'info',
-          })
-        }
-        return
-      case '/help':
-        push({
-          kind: 'notice',
-          id: uid(),
-          text: 'Slash commands:\n' + SLASH_COMMANDS.map((c) => `  ${c.name}${c.arg ? ' ' + c.arg : ''} — ${c.desc}`).join('\n'),
-          tone: 'info',
-        })
-        return
-    }
-  }
-
-  // Palette is open while typing a command NAME (a leading "/" with no space
-  // yet) and not dismissed; once a space is typed we're in argument entry and
-  // the popover hides.
-  const slashTyping = input.startsWith('/') && !input.includes(' ') && !input.includes('\n')
-  const slashMatches = slashTyping && !slashClosed ? SLASH_COMMANDS.filter((c) => c.name.startsWith(input)) : []
-  const slashOpen = slashMatches.length > 0
-  const slashIdx = slashMatches.length ? Math.min(slashSel, slashMatches.length - 1) : 0
-  // Complete to a command: commands with an arg get a trailing space; the rest
-  // run immediately.
-  const pickSlash = (c: SlashCmd): void => {
-    if (c.arg) {
-      setInput(c.name + ' ')
-      setSlashClosed(true)
-      inputRef.current?.focus()
-    } else {
-      setInput('')
-      void runSlash(c.name)
-    }
-  }
-
-  const sendPrompt = async (): Promise<void> => {
-    const text = input.trim()
-    if ((!text && attachments.length === 0) || !connected) return
-    // A pending ask_user consumes the next typed message as the user's custom
-    // answer (selection -1), rather than starting a fresh prompt. Attachments
-    // aren't part of an answer, so only plain text routes here.
-    if (ask && text && attachments.length === 0) {
-      setInput('')
-      await answerAsk(-1, text)
-      return
-    }
-    // A known slash command runs instead of being sent as a prompt.
-    if (attachments.length === 0 && SLASH_COMMANDS.some((c) => c.name === text.split(/\s+/)[0])) {
-      setInput('')
-      setSlashClosed(false)
-      setSlashSel(0)
-      await runSlash(text)
-      return
-    }
-    const atts = attachments
-    setInput('')
-    setAttachments([])
-    // Mid-turn: queue instead of rejecting — it dispatches when the turn ends.
-    if (busy) {
-      setQueue((q) => [...q, { text, images: atts }])
-      return
-    }
-    await dispatchPrompt(text, atts)
-  }
-
-  // Auto-dispatch the queue whenever the agent goes idle.
-  useEffect(() => {
-    if (busy || !connected || queue.length === 0) return
-    const [next, ...rest] = queue
-    setQueue(rest)
-    void dispatchPrompt(next.text, next.images)
-  }, [busy, connected, queue, dispatchPrompt])
+  const { slashOpen, slashMatches, slashIdx, pickSlash, sendPrompt } = useSlashCommands({
+    cwd,
+    input,
+    setInput,
+    attachments,
+    setAttachments,
+    slashClosed,
+    setSlashClosed,
+    slashSel,
+    setSlashSel,
+    inputRef,
+    busy,
+    setBusy,
+    connected,
+    ask,
+    answerAsk,
+    queue,
+    setQueue,
+    dispatchPrompt,
+    models,
+    activeModel,
+    push,
+    endTurn,
+    setPhase,
+    setTurnStart,
+    setElapsed,
+  })
 
   const awaitingApproval = items.some(
     (it) => it.kind === 'tool' && it.status === 'pending_approval',
   )
 
-  // Search modal: matches user/assistant messages; clicking a result jumps to
-  // (and briefly flashes) the message in the transcript. The transcript itself
-  // always shows everything — no inline filtering.
-  const trimmedQuery = query.trim().toLowerCase()
-  const searchResults = trimmedQuery
-    ? items
-        .filter(
-          (it): it is Extract<Item, { kind: 'user' | 'assistant' }> =>
-            (it.kind === 'user' || it.kind === 'assistant') &&
-            it.text.toLowerCase().includes(trimmedQuery),
-        )
-        .slice(0, 50)
-    : []
-  const [flashId, setFlashId] = useState<string | null>(null)
-  const flashTimer = useRef<number | undefined>(undefined)
-  const jumpToMessage = (id: string): void => {
-    setSearchOpen(false)
-    scrollToMessage(id)
-    setFlashId(id)
-    window.clearTimeout(flashTimer.current)
-    flashTimer.current = window.setTimeout(() => setFlashId(null), 1600)
-  }
+  const {
+    query,
+    setQuery,
+    searchOpen,
+    setSearchOpen,
+    flashId,
+    trimmedQuery,
+    searchResults,
+    jumpToMessage,
+  } = useSearch(items, scrollToMessage)
 
   // Consecutive tool calls collapse into one group card (agents often chain
   // several reads/writes back to back); anything else renders as itself.
@@ -842,42 +509,13 @@ export default function Workspace({
       (it.kind === 'user' || it.kind === 'assistant') && !!it.pinned,
   )
 
-  const togglePin = (id: string): void => {
-    setItems((prev) =>
-      prev.map((it) =>
-        it.id === id && (it.kind === 'user' || it.kind === 'assistant')
-          ? { ...it, pinned: !it.pinned }
-          : it,
-      ),
-    )
-  }
-
-  const copyMessage = (id: string): void => {
-    const it = items.find((i) => i.id === id)
-    if (it && (it.kind === 'user' || it.kind === 'assistant')) {
-      void navigator.clipboard.writeText(it.text)
-      showToast('message copied')
-    }
-  }
-
-  const scrollToMessage = (id: string): void => {
-    document.getElementById(`msg-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  }
-
-  // Any click or Escape dismisses the message context menu.
-  useEffect(() => {
-    if (!msgMenu) return
-    const close = (): void => setMsgMenu(null)
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') close()
-    }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('click', close)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [msgMenu])
+  const { togglePin, copyMessage } = useMessageMenu({
+    msgMenu,
+    setMsgMenu,
+    items,
+    setItems,
+    showToast,
+  })
 
   // Any click or Escape dismisses the composer clipboard menu.
   useEffect(() => {

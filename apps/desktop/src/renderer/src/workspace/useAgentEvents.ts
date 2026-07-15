@@ -1,105 +1,67 @@
-import { useCallback, useRef } from 'react'
-import type { AgentEvent, ModelProfile, PermissionMode } from '@codehamr-ui/protocol'
+import { useCallback } from 'react'
+import type { AgentEvent } from '@codehamr-ui/protocol'
 import { PROTOCOL_VERSION } from '@codehamr-ui/protocol'
 import type { Item, Phase } from './types'
 import { uid } from './types'
 import { toolLabel, isAbsPath } from './helpers'
 
-interface AgentEventsDeps {
-  cwd: string
-  mode: PermissionMode
-  setConnected: (v: boolean) => void
-  setActiveModel: (v: string) => void
-  setModels: (v: ModelProfile[]) => void
-  setMode: (v: PermissionMode) => void
-  setItems: React.Dispatch<React.SetStateAction<Item[]>>
-  setBusy: (v: boolean) => void
-  setPhase: (v: Phase) => void
-  setRunningTool: (v: string) => void
-  setTurnStart: (v: number | null) => void
-  setStep: React.Dispatch<React.SetStateAction<number>>
-  setStreamMeter: (v: { tokens: number; tokPerSec: number } | null) => void
-  setAsk: (v: { callId: string; prompt: string; options: string[] } | null) => void
-  setLastInference: (v: { promptTokens: number; completionTokens: number; durationMs?: number } | null) => void
-  showToast: (msg: string) => void
-  reloadDirs: (paths: string[]) => void
-  requestAgentPreview: (path?: string, url?: string) => void
-  resetSessionStats: () => void
-}
-
 /**
- * Agent event handler: processes protocol events from the agent and updates
- * transcript state. Owns `endTurn`, `push`, and the timing refs that track
- * generation speed.
+ * useAgentEvents: handles all agent protocol events (ready, deltas, tool calls, etc.)
+ * and updates workspace state accordingly. Extracted from Workspace.tsx to reduce
+ * its size and improve maintainability.
  */
 export function useAgentEvents({
   cwd,
-  mode,
+  modeRef,
+  showToast,
   setConnected,
   setActiveModel,
   setModels,
   setMode,
+  resetSessionStats,
+  endTurn,
+  push,
+  reloadDirs,
   setItems,
-  setBusy,
+  requestAgentPreview,
+  setAsk,
   setPhase,
-  setRunningTool,
-  setTurnStart,
+  genStartRef,
+  genCharsRef,
+  prefillMsRef,
+  roundStartRef,
   setStep,
   setStreamMeter,
-  setAsk,
+  setRunningTool,
   setLastInference,
-  showToast,
-  reloadDirs,
-  requestAgentPreview,
-  resetSessionStats,
-}: AgentEventsDeps): {
-  push: (item: Item) => void
+  lastGenMsRef,
+}: {
+  cwd: string
+  modeRef: React.MutableRefObject<string>
+  showToast: (msg: string) => void
+  setConnected: (v: boolean) => void
+  setActiveModel: (v: string) => void
+  setModels: (v: any[]) => void
+  setMode: (v: any) => void
+  resetSessionStats: () => void
   endTurn: () => void
-  onEvent: (event: AgentEvent) => void
-  modeRef: React.MutableRefObject<PermissionMode>
+  push: (item: Item) => void
+  reloadDirs: (dirs: string[]) => void
+  setItems: React.Dispatch<React.SetStateAction<Item[]>>
+  requestAgentPreview: (path?: string, url?: string) => void
+  setAsk: (v: { callId: string; prompt: string; options: string[] } | null) => void
+  setPhase: (v: Phase) => void
   genStartRef: React.MutableRefObject<number | null>
-  lastGenMsRef: React.MutableRefObject<number | null>
   genCharsRef: React.MutableRefObject<number>
   prefillMsRef: React.MutableRefObject<number | null>
   roundStartRef: React.MutableRefObject<number | null>
-} {
-  const push = useCallback((item: Item) => {
-    setItems((prev) => [...prev, item])
-  }, [setItems])
-
-  // The agent always boots in ask mode, so every start/restart must re-apply
-  // the workspace's chosen mode. A ref keeps onEvent free of a mode dep.
-  const modeRef = useRef<PermissionMode>('ask')
-  modeRef.current = mode
-
-  const genStartRef = useRef<number | null>(null)
-  const lastGenMsRef = useRef<number | null>(null)
-  const genCharsRef = useRef(0) // chars streamed in the current generation (≈ tokens×4)
-  const prefillMsRef = useRef<number | null>(null) // time-to-first-token of the current round
-  const roundStartRef = useRef<number | null>(null) // when the current round's wait began
-
-  const endTurn = useCallback(() => {
-    setBusy(false)
-    setPhase('idle')
-    setRunningTool('')
-    setTurnStart(null)
-    setStep(0)
-    setStreamMeter(null)
-    genCharsRef.current = 0
-    prefillMsRef.current = null
-    roundStartRef.current = null
-    // Freeze any still-streaming bubbles so the caret stops blinking.
-    setItems((prev) =>
-      prev.map((it) =>
-        (it.kind === 'assistant' || it.kind === 'reasoning') && it.streaming
-          ? { ...it, streaming: false }
-          : it,
-      ),
-    )
-  }, [setBusy, setPhase, setRunningTool, setTurnStart, setStep, setStreamMeter, setItems])
-
-  // Fold agent events into the transcript.
-  const onEvent = useCallback(
+  setStep: React.Dispatch<React.SetStateAction<number>>
+  setStreamMeter: (v: { tokens: number; tokPerSec: number } | null) => void
+  setRunningTool: (v: string) => void
+  setLastInference: (v: any) => void
+  lastGenMsRef: React.MutableRefObject<number | null>
+}): (event: AgentEvent) => void {
+  return useCallback(
     (event: AgentEvent) => {
       switch (event.type) {
         case 'ready':
@@ -110,7 +72,7 @@ export function useAgentEvents({
             void window.codehamr.send(cwd, {
               v: PROTOCOL_VERSION,
               type: 'set_mode',
-              mode: modeRef.current,
+              mode: modeRef.current as 'ask' | 'auto',
             })
           }
           if (event.historyLen) {
@@ -129,12 +91,12 @@ export function useAgentEvents({
             text:
               event.historyLen === 0
                 ? 'Nothing to compact yet.'
-                : `Context compacted — ${event.message ?? 'the agent\'s memory was summarized'}. Your visible chat is unchanged.`,
+                : `Context compacted — ${event.message ?? "the agent's memory was summarized"}. Your visible chat is unchanged.`,
             tone: 'info',
           })
           break
         case 'mode':
-          setMode(event.mode) // the agent is the source of truth
+          setMode(event.mode as 'ask' | 'auto') // the agent is the source of truth
           break
         case 'file_diff': {
           // Reload just the edited file's directory (the watcher also catches
@@ -280,37 +242,6 @@ export function useAgentEvents({
           break
       }
     },
-    [
-      endTurn,
-      push,
-      showToast,
-      reloadDirs,
-      requestAgentPreview,
-      cwd,
-      setConnected,
-      setActiveModel,
-      setModels,
-      setMode,
-      setItems,
-      setPhase,
-      setRunningTool,
-      setStep,
-      setStreamMeter,
-      setAsk,
-      setLastInference,
-      resetSessionStats,
-    ],
+    [cwd, modeRef, showToast, setConnected, setActiveModel, setModels, setMode, resetSessionStats, endTurn, push, reloadDirs, setItems, requestAgentPreview, setAsk, setPhase, genStartRef, genCharsRef, prefillMsRef, roundStartRef, setStep, setStreamMeter, setRunningTool, setLastInference, lastGenMsRef],
   )
-
-  return {
-    push,
-    endTurn,
-    onEvent,
-    modeRef,
-    genStartRef,
-    lastGenMsRef,
-    genCharsRef,
-    prefillMsRef,
-    roundStartRef,
-  }
 }
