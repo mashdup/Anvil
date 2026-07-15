@@ -27,6 +27,7 @@ import { useMessageMenu } from './workspace/useMessageMenu'
 import { useScrollManager } from './workspace/useScrollManager'
 import { useSessionState } from './workspace/useSessionState'
 import { useMenuDismiss, useMenuDismissDeferred } from './workspace/useMenuDismiss'
+import { useKeyboardShortcuts } from './workspace/useKeyboardShortcuts'
 import { useSlashCommands } from './workspace/useSlashCommands'
 import { useSearch } from './workspace/useSearch'
 import { TREE_MIN, TREE_MAX, PREVIEW_MIN } from './workspace/layout'
@@ -543,32 +544,18 @@ export default function Workspace({
   }, [dragOver])
 
   // Keyboard shortcuts, active tab only.
-  useEffect(() => {
-    if (!visible) return
-    const h = (e: KeyboardEvent): void => {
-      if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
-        e.preventDefault()
-        setSearchOpen(true)
-      } else if (e.ctrlKey && e.key.toLowerCase() === 'b') {
-        e.preventDefault()
-        setShowFiles((s) => !s)
-      } else if (e.ctrlKey && e.key === ',') {
-        e.preventDefault()
-        setShowSettings(true)
-      } else if (e.key === 'Escape') {
-        if (searchOpen) {
-          setSearchOpen(false)
-          setQuery('')
-        } else if (historyOpen) {
-          setHistoryOpen(false)
-        } else if (viewer) {
-          closeViewer()
-        }
-      }
-    }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [visible, searchOpen, historyOpen, viewer])
+  useKeyboardShortcuts({
+    visible,
+    searchOpen,
+    historyOpen,
+    viewer,
+    setSearchOpen,
+    setQuery,
+    setHistoryOpen,
+    setShowFiles,
+    setShowSettings,
+    closeViewer,
+  })
 
   // The stacked preview panels (file viewer + live browser), rendered the same
   // whether they sit inline in the column or float as an overlay modal.
