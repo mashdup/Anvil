@@ -70,7 +70,40 @@ const api = {
     ipcRenderer.invoke('auth:logout', provider, cwd),
   gitDiffStat: (cwd: string): Promise<{ added: number; removed: number } | null> =>
     ipcRenderer.invoke('git:diffstat', cwd),
+  /** Full unified diff of the whole working tree vs HEAD, for the diff badge. */
+  gitDiff: (cwd: string): Promise<string | null> => ipcRenderer.invoke('git:diff', cwd),
   gitBranch: (cwd: string): Promise<string | null> => ipcRenderer.invoke('git:branch', cwd),
+  /** Branch badge: current branch + upstream + ahead/behind + dirty snapshot. */
+  gitBranchInfo: (
+    cwd: string,
+  ): Promise<{
+    current: string | null
+    detached: boolean
+    upstream: string | null
+    ahead: number
+    behind: number
+    dirty: boolean
+  }> => ipcRenderer.invoke('git:branchInfo', cwd),
+  /** Local branch names for the switch menu (current first, recent order). */
+  gitListBranches: (
+    cwd: string,
+  ): Promise<{ name: string; remote: boolean; ref?: string }[]> =>
+    ipcRenderer.invoke('git:listBranches', cwd),
+  /** Check out an existing branch. Returns { ok, error } — never throws. */
+  gitCheckout: (cwd: string, branch: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:checkout', cwd, branch),
+  /** Create and switch to a new branch off HEAD. Returns { ok, error }. */
+  gitCreateBranch: (cwd: string, name: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:createBranch', cwd, name),
+  /** Fetch all remotes with prune. Returns { ok, error }. */
+  gitFetch: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:fetch', cwd),
+  /** Fast-forward-only pull. Returns { ok, error }. */
+  gitPull: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:pull', cwd),
+  /** Push the current branch, optionally setting upstream. Returns { ok, error }. */
+  gitPush: (cwd: string, setUpstream: boolean): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:push', cwd, setUpstream),
   /** One-shot project summary for the empty-chat screen (branch, last commit,
    *  tracked file count, working-tree change counts, diffstat). */
   projectStats: (

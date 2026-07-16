@@ -15,6 +15,7 @@ import { SearchModal, HistoryModal } from './components/Modals'
 import { CheckpointTimeline } from './components/CheckpointTimeline'
 import { CheckpointDiffModal } from './components/CheckpointDiffModal'
 import { ProjectStatsView } from './components/ProjectStatsView'
+import { BranchBadge } from './components/BranchBadge'
 import { Logo } from './Logo'
 import type { Attachment, InferenceStats, Item, ToolItem, SlashCmd, ChatEntry } from './workspace/types'
 import { uid, reseatIds, SLASH_COMMANDS, MAX_ATTACHMENTS } from './workspace/types'
@@ -66,6 +67,8 @@ export default function Workspace({
   const [checkpointCount, setCheckpointCount] = useState(0)
   const [showCheckpoints, setShowCheckpoints] = useState(false)
   const [checkpointDiff, setCheckpointDiff] = useState<{ ref: string; diff: string } | null>(null)
+  // Working-tree diff shown when the git-diff badge is clicked (null = closed).
+  const [workingDiff, setWorkingDiff] = useState<string | null>(null)
   // Refresh checkpoint list after turn completes
   const refreshCheckpointList = useCallback(async () => {
     try {
@@ -749,31 +752,20 @@ export default function Workspace({
         )}
         <div className="relative ml-auto flex items-center gap-2 text-xs text-zinc-400">
           {currentBranch && (
-            <div
-              title="current git branch"
-              className="flex max-w-[12rem] items-center gap-1 rounded border border-zinc-700 bg-zinc-900/50 px-2 py-0.5 font-mono text-sky-400"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                className="h-3 w-3 shrink-0"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <line x1="6" y1="3" x2="6" y2="15" />
-                <circle cx="18" cy="6" r="3" />
-                <circle cx="6" cy="18" r="3" />
-                <path d="M18 9a9 9 0 0 1-9 9" />
-              </svg>
-              <span className="truncate">{currentBranch}</span>
-            </div>
+            <BranchBadge
+              cwd={cwd}
+              currentBranch={currentBranch}
+              onRefresh={refreshGitStat}
+              onToast={showToast}
+            />
           )}
           {diffStats && (diffStats.added > 0 || diffStats.removed > 0) && (
-            <div
-              title="git diff — lines changed in the working tree vs HEAD"
-              className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-900/50 px-2 py-0.5 font-mono"
+            <button
+              onClick={() => {
+                void window.codehamr.gitDiff(cwd).then((d) => setWorkingDiff(d ?? ''))
+              }}
+              title="git diff - lines changed in the working tree vs HEAD (click to view)"
+              className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-900/50 px-2 py-0.5 font-mono hover:bg-zinc-800"
             >
               {diffStats.added > 0 && (
                 <span className="text-emerald-400">+{diffStats.added.toLocaleString()}</span>
@@ -781,7 +773,7 @@ export default function Workspace({
               {diffStats.removed > 0 && (
                 <span className="text-red-400">-{diffStats.removed.toLocaleString()}</span>
               )}
-            </div>
+            </button>
           )}
           {checkpointCount > 0 && (
             <button
@@ -1106,15 +1098,17 @@ export default function Workspace({
                   activeModel={activeModel}
                   promptTokens={lastInference?.promptTokens ?? 0}
                   contextWindow={lastInference?.contextWindow ?? 0}
+                  lastTotalTokens={
+                    lastInference
+                      ? lastInference.promptTokens + lastInference.completionTokens
+                      : 0
+                  }
                 />
                 {lastInference && (
                   <div
                     className="flex items-center gap-1.5 font-mono text-[10px] text-zinc-500"
                     title={`last message — ${lastInference.promptTokens.toLocaleString()} prompt + ${lastInference.completionTokens.toLocaleString()} completion tokens`}
                   >
-                    <span>
-                      {(lastInference.promptTokens + lastInference.completionTokens).toLocaleString()} tok
-                    </span>
                     {!!lastInference.durationMs && lastInference.durationMs > 0 && (
                       <>
                         <span className="text-zinc-600">·</span>
@@ -1383,6 +1377,16 @@ export default function Workspace({
           ref={checkpointDiff.ref}
           onClose={() => setCheckpointDiff(null)}
           onRevert={() => void handleRevert(checkpointDiff.ref)}
+        />
+      )}
+
+      {workingDiff !== null && (
+        <CheckpointDiffModal
+          diff={workingDiff}
+          ref=""
+          title="Working Tree Diff"
+          emptyMessage="No uncommitted changes"
+          onClose={() => setWorkingDiff(null)}
         />
       )}
 

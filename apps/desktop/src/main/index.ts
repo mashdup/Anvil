@@ -475,6 +475,62 @@ async function gitFileDiff(cwd: string, abs: string): Promise<string | null> {
   return out
 }
 
+/**
+ * Full unified diff of the whole working tree vs HEAD (or the index in a repo
+ * with no commits yet), including untracked files rendered as all-added diffs
+ * so the git-diff badge shows every pending change. Returns null when it's not
+ * a repo / git is missing, '' when the tree is clean.
+ */
+async function gitDiff(cwd: string): Promise<string | null> {
+  const run = async (args: string[]): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+        windowsHide: true,
+        timeout: 10000,
+        maxBuffer: 64 * 1024 * 1024,
+      })
+      return stdout
+    } catch {
+      return null
+    }
+  }
+  const tracked = (await run(['diff', 'HEAD', '--no-color'])) ?? (await run(['diff', '--no-color']))
+  if (tracked === null) return null // not a repo / git missing
+  const parts: string[] = []
+  if (tracked.trim()) parts.push(tracked.replace(/\n$/, ''))
+  // Untracked new files: synthesize an all-added diff for each (respects
+  // .gitignore via --exclude-standard, matching gitFileDiff/gitDiffStat).
+  const untracked = await run(['ls-files', '--others', '--exclude-standard'])
+  if (untracked) {
+    for (const rel of untracked.split('\n').filter(Boolean).slice(0, 5000)) {
+      try {
+        const abs = join(cwd, rel)
+        const info = await stat(abs)
+        if (info.size > 10 * 1024 * 1024) continue // skip huge blobs
+        const buf = await readFile(abs)
+        if (buf.subarray(0, 8192).includes(0)) continue // binary
+        const text = buf.toString('utf8')
+        const lines = text.length ? text.replace(/\n$/, '').split('\n') : []
+        const body = lines.map((l) => `+${l}`).join('\n')
+        const noNewline =
+          text.length && !text.endsWith('\n') ? '\n\\ No newline at end of file' : ''
+        parts.push(
+          `diff --git a/${rel} b/${rel}\n` +
+            `new file\n` +
+            `--- /dev/null\n` +
+            `+++ b/${rel}\n` +
+            `@@ -0,0 +1,${lines.length} @@\n` +
+            body +
+            noNewline,
+        )
+      } catch {
+        /* unreadable file: skip */
+      }
+    }
+  }
+  return parts.join('\n')
+}
+
 /** Working-tree git status for the file tree: absolute paths of changed files,
  *  split by kind so the UI can tint them. `modified` covers tracked edits and
  *  deletions; `added` covers staged new files; `untracked` covers new,
@@ -557,6 +613,193 @@ async function gitBranch(cwd: string): Promise<string | null> {
   // Detached HEAD (empty branch name): show the short commit instead.
   const sha = await run(['rev-parse', '--short', 'HEAD'])
   return sha || null
+}
+
+// ---------------------------------------------------------------------------
+// Branch badge operations: switch, create, and sync (fetch/pull/push). Every
+// op runs a real `git` in cwd, returns a small structured result, and never
+// throws to the renderer — failures come back as { ok: false, error } so the
+// badge can toast a readable message instead of crashing the UI.
+// ---------------------------------------------------------------------------
+
+export interface BranchInfo {
+  /** Current local branch, or short SHA when detached. null = not a repo. */
+  current: string | null
+  detached: boolean
+  /** Configured upstream (e.g. "origin/main"), or null when none is set. */
+  upstream: string | null
+  /** Commits the local branch is ahead / behind its upstream. */
+  ahead: number
+  behind: number
+  /** True when the working tree has uncommitted changes (switch guard). */
+  dirty: boolean
+}
+
+export interface GitOpResult {
+  ok: boolean
+  error?: string
+}
+
+/** Run a git command, returning trimmed stdout or null on any failure. */
+async function gitRun(cwd: string, args: string[], timeout = 5000): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP('git', ['-C', cwd, ...args], {
+      windowsHide: true,
+      timeout,
+      maxBuffer: 8 * 1024 * 1024,
+    })
+    return stdout.trim()
+  } catch {
+    return null
+  }
+}
+
+/** Run a git command for its exit status, capturing stderr for the message. */
+async function gitExec(cwd: string, args: string[], timeout = 30000): Promise<GitOpResult> {
+  try {
+    await execFileP('git', ['-C', cwd, ...args], { windowsHide: true, timeout })
+    return { ok: true }
+  } catch (e) {
+    const err = e as { stderr?: string; message?: string }
+    const raw = (err.stderr || err.message || 'git command failed').trim()
+    // Keep it to the first couple of meaningful lines — git errors can be long.
+    const msg = raw.split('\n').filter(Boolean).slice(0, 2).join(' — ')
+    return { ok: false, error: msg }
+  }
+}
+
+/**
+ * Branch/upstream/ahead-behind/dirty snapshot for the badge dropdown. Returns
+ * current=null when it's not a repo / git missing so the UI hides the badge.
+ */
+async function gitBranchInfo(cwd: string): Promise<BranchInfo> {
+  const none: BranchInfo = {
+    current: null,
+    detached: false,
+    upstream: null,
+    ahead: 0,
+    behind: 0,
+    dirty: false,
+  }
+  const branch = await gitRun(cwd, ['branch', '--show-current'])
+  if (branch === null) return none // not a repo / git missing
+
+  let current = branch
+  let detached = false
+  if (branch === '') {
+    detached = true
+    current = (await gitRun(cwd, ['rev-parse', '--short', 'HEAD'])) || 'HEAD'
+  }
+
+  const upstream = branch
+    ? await gitRun(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+    : null
+
+  let ahead = 0
+  let behind = 0
+  if (upstream) {
+    // "<behind>\t<ahead>" from --left-right against the upstream.
+    const counts = await gitRun(cwd, [
+      'rev-list',
+      '--left-right',
+      '--count',
+      `${upstream}...HEAD`,
+    ])
+    if (counts) {
+      const [b, a] = counts.split(/\s+/).map(Number)
+      behind = Number.isFinite(b) ? b : 0
+      ahead = Number.isFinite(a) ? a : 0
+    }
+  }
+
+  const dirtyOut = await gitRun(cwd, ['status', '--porcelain'])
+  const dirty = !!dirtyOut && dirtyOut !== ''
+
+  return { current, detached, upstream: upstream || null, ahead, behind, dirty }
+}
+
+export interface BranchListEntry {
+  /** Name to check out: local branch name, or bare name for a remote branch. */
+  name: string
+  /** True when this exists only on a remote (checkout creates a tracking branch). */
+  remote: boolean
+  /** For a remote-only entry, the full ref (e.g. "origin/main") for display. */
+  ref?: string
+}
+
+/**
+ * Branches for the switch menu: every local branch, plus remote-tracking
+ * branches that have NO local counterpart yet (so `main` shows even when you've
+ * only ever checked out `dev` in a fresh clone). Most-recently-committed order.
+ * Checking out a remote-only entry lets git's DWIM create a local tracking
+ * branch. Empty array when not a repo.
+ */
+async function gitListBranches(cwd: string): Promise<BranchListEntry[]> {
+  const locals = await gitRun(cwd, [
+    'for-each-ref',
+    '--sort=-committerdate',
+    '--format=%(refname:short)',
+    'refs/heads',
+  ])
+  if (locals === null) return [] // not a repo / git missing
+  const localNames = locals.split('\n').filter(Boolean)
+  const localSet = new Set(localNames)
+
+  const remotes = await gitRun(cwd, [
+    'for-each-ref',
+    '--sort=-committerdate',
+    '--format=%(refname:short)',
+    'refs/remotes',
+  ])
+  const remoteEntries: BranchListEntry[] = []
+  if (remotes) {
+    for (const ref of remotes.split('\n').filter(Boolean)) {
+      // Skip the symbolic origin/HEAD pointer — it's not a real branch.
+      if (ref.endsWith('/HEAD')) continue
+      // Strip the remote name (first path segment) to get the branch name.
+      const slash = ref.indexOf('/')
+      if (slash === -1) continue
+      const bare = ref.slice(slash + 1)
+      // Only surface remote branches without an existing local counterpart.
+      if (localSet.has(bare)) continue
+      remoteEntries.push({ name: bare, remote: true, ref })
+    }
+  }
+
+  return [...localNames.map((name) => ({ name, remote: false })), ...remoteEntries]
+}
+
+/** Check out an existing branch (git DWIM auto-creates a local tracking branch
+ *  for a remote-only name). Fails cleanly if the switch is unsafe. */
+async function gitCheckout(cwd: string, branch: string): Promise<GitOpResult> {
+  return gitExec(cwd, ['checkout', branch])
+}
+
+/** Create and switch to a new branch off the current HEAD. */
+async function gitCreateBranch(cwd: string, name: string): Promise<GitOpResult> {
+  const trimmed = name.trim()
+  if (!trimmed) return { ok: false, error: 'branch name is required' }
+  return gitExec(cwd, ['checkout', '-b', trimmed])
+}
+
+/** Fetch all remotes with prune (updates ahead/behind without changing files). */
+async function gitFetch(cwd: string): Promise<GitOpResult> {
+  return gitExec(cwd, ['fetch', '--all', '--prune'], 60000)
+}
+
+/** Pull with --ff-only so a divergent history surfaces as an error, not a merge. */
+async function gitPull(cwd: string): Promise<GitOpResult> {
+  return gitExec(cwd, ['pull', '--ff-only'], 60000)
+}
+
+/** Push the current branch, setting upstream when none is configured yet. */
+async function gitPush(cwd: string, setUpstream: boolean): Promise<GitOpResult> {
+  if (setUpstream) {
+    const branch = await gitRun(cwd, ['branch', '--show-current'])
+    if (!branch) return { ok: false, error: 'not on a branch (detached HEAD)' }
+    return gitExec(cwd, ['push', '--set-upstream', 'origin', branch], 60000)
+  }
+  return gitExec(cwd, ['push'], 60000)
 }
 
 /**
@@ -985,6 +1228,7 @@ function wireIpc(): void {
   // removed lines. Returns null when it's not a git repo or git is missing, so
   // the UI can hide the badge.
   ipcMain.handle('git:diffstat', async (_evt, cwd: string) => gitDiffStat(cwd))
+  ipcMain.handle('git:diff', async (_evt, cwd: string) => gitDiff(cwd))
   ipcMain.handle('git:filechanges', async (_evt, cwd: string, abs: string) =>
     gitFileChanges(cwd, abs),
   )
@@ -993,6 +1237,22 @@ function wireIpc(): void {
   )
   ipcMain.handle('git:status', async (_evt, cwd: string) => gitStatus(cwd))
   ipcMain.handle('git:branch', async (_evt, cwd: string) => gitBranch(cwd))
+  // Branch badge: richer branch state (upstream + ahead/behind + dirty) and the
+  // switch/create/sync operations it drives. Ops return { ok, error } instead
+  // of throwing so the badge can surface a readable toast on failure.
+  ipcMain.handle('git:branchInfo', async (_evt, cwd: string) => gitBranchInfo(cwd))
+  ipcMain.handle('git:listBranches', async (_evt, cwd: string) => gitListBranches(cwd))
+  ipcMain.handle('git:checkout', async (_evt, cwd: string, branch: string) =>
+    gitCheckout(cwd, branch),
+  )
+  ipcMain.handle('git:createBranch', async (_evt, cwd: string, name: string) =>
+    gitCreateBranch(cwd, name),
+  )
+  ipcMain.handle('git:fetch', async (_evt, cwd: string) => gitFetch(cwd))
+  ipcMain.handle('git:pull', async (_evt, cwd: string) => gitPull(cwd))
+  ipcMain.handle('git:push', async (_evt, cwd: string, setUpstream: boolean) =>
+    gitPush(cwd, setUpstream),
+  )
   // One-shot project summary for the empty-chat screen (branch, last commit,
   // tracked file count, working-tree change counts, diffstat).
   ipcMain.handle('project:stats', async (_evt, cwd: string) => projectStats(cwd))
