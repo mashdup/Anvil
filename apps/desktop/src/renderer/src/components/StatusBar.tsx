@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import type { ModelProfile } from '@codehamr-ui/protocol'
 import type { Phase } from '../workspace/types'
 
@@ -28,25 +29,49 @@ export function VisionHint({
 }
 
 /**
- * ContextMeter shows how full the active model's context window is, using the
+ * ContextMeter shows how full the active model’s context window is, using the
  * prompt-token count of the last turn (what the agent actually packed and
  * sent) against the effective window. The denominator is the agent-reported
  * contextWindow when available (covers server-managed profiles whose config
- * omits context_size), else the profile's configured contextSize. A thin bar
- * plus a percentage; it warns-tones as the window fills so a compact/clear is
- * an obvious next move before the agent starts trimming history.
+ * omits context_size), else the profile’s configured contextSize. A tight
+ * vertical bar that fills bottom-to-top; it warns-tones as the window fills.
+ * Tap the bar for a popup (anchored to the bar) with the exact percentage and
+ * token count, so a compact/clear is an obvious next move before the agent
+ * starts trimming history.
  */
 export function ContextMeter({
   models,
   activeModel,
   promptTokens,
   contextWindow,
+  lastTotalTokens,
 }: {
   models: ModelProfile[]
   activeModel: string
   promptTokens: number
   contextWindow: number
+  lastTotalTokens?: number
 }): React.JSX.Element | null {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  // Dismiss the popup on any outside click / Escape.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent): void => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
   const denom = contextWindow || (models.find((m) => m.name === activeModel)?.contextSize ?? 0)
   if (!denom) return null
   const ratio = Math.min(Math.max(promptTokens, 0) / denom, 1)
@@ -56,16 +81,36 @@ export function ContextMeter({
   const barColor =
     ratio >= 0.9 ? 'bg-red-500' : ratio >= 0.75 ? 'bg-amber-500' : 'bg-zinc-500'
   return (
-    <div
-      className={`flex items-center gap-1.5 font-mono text-[10px] ${tone}`}
-      title={`context window — ${promptTokens.toLocaleString()} of ${denom.toLocaleString()} tokens (${pct}%) ${
-        promptTokens > 0 ? 'used by the last prompt' : 'used'
-      }`}
-    >
-      <div className="h-1.5 w-10 overflow-hidden rounded-full bg-zinc-800">
-        <div className={`h-full ${barColor}`} style={{ width: `${Math.max(pct, 2)}%` }} />
-      </div>
-      <span>{pct}%</span>
+    <div ref={rootRef} className="relative flex items-center">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-label={`context window ${pct}% used`}
+        aria-expanded={open}
+        title="context window — tap for details"
+        className="flex h-5 w-1.5 items-end overflow-hidden rounded-full bg-zinc-800 outline-none ring-offset-1 ring-offset-zinc-900 focus-visible:ring-1 focus-visible:ring-zinc-500"
+      >
+        <div
+          className={`w-full rounded-full ${barColor} transition-[height]`}
+          style={{ height: `${Math.max(ratio * 100, 4)}%` }}
+        />
+      </button>
+      {open && (
+        <div
+          className={`absolute bottom-full left-1/2 z-20 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 font-mono text-[10px] shadow-lg ${tone}`}
+        >
+          <div className="font-semibold">{pct}% of context</div>
+          <div className="text-zinc-400">
+            {promptTokens.toLocaleString()} / {denom.toLocaleString()} tokens
+          </div>
+          {lastTotalTokens != null && lastTotalTokens > 0 && (
+            <div className="mt-0.5 text-zinc-500">
+              {lastTotalTokens.toLocaleString()} tokens last message
+            </div>
+          )}
+          <div className="absolute left-1/2 top-full -mt-px h-1.5 w-1.5 -translate-x-1/2 rotate-45 border-b border-r border-zinc-700 bg-zinc-900" />
+        </div>
+      )}
     </div>
   )
 }

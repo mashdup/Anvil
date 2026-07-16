@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import Workspace from './Workspace'
 import { Logo } from './Logo'
+import { StartScreen, pushRecent } from './StartScreen'
 import { applyStoredTheme, applyZoom, loadZoom, applyTheme, loadThemeChoice } from './themes'
 
 // Apply before first paint — a flash of the stock theme would be ugly.
@@ -40,11 +41,16 @@ export default function App(): React.JSX.Element {
   useEffect(() => window.codehamr.onUpdateReady(setUpdateVersion), [])
   useEffect(() => window.codehamr.onUpdateError(setUpdateError), [])
 
+  const openPath = (dir: string): void => {
+    pushRecent(dir)
+    setTabs((prev) => (prev.includes(dir) ? prev : [...prev, dir]))
+    setActive(dir)
+  }
+
   const openWorkspace = async (): Promise<void> => {
     const dir = await window.codehamr.pickWorkspace()
     if (!dir) return
-    setTabs((prev) => (prev.includes(dir) ? prev : [...prev, dir]))
-    setActive(dir)
+    openPath(dir)
   }
 
   // Ctrl+O opens a project from anywhere.
@@ -137,14 +143,7 @@ export default function App(): React.JSX.Element {
       </header>
 
       {tabs.length === 0 && (
-        <div className="flex flex-1 items-center justify-center">
-          <button
-            onClick={() => void openWorkspace()}
-            className="rounded bg-zinc-800 px-4 py-2 text-sm hover:bg-zinc-700"
-          >
-            Open a project folder to start
-          </button>
-        </div>
+        <StartScreen onOpen={() => void openWorkspace()} onOpenPath={openPath} />
       )}
 
       {tabs.map((dir) => (
