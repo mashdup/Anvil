@@ -6,6 +6,7 @@ import {
   createWriteStream,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   watch,
   type WriteStream,
   type FSWatcher,
@@ -946,6 +947,20 @@ function wireIpc(): void {
   ipcMain.handle('git:init', async (_evt, cwd: string): Promise<boolean> => {
     try {
       await execFileP('git', ['-C', cwd, 'init'], { windowsHide: true, timeout: 10000 })
+
+      // Add .codehamr to .gitignore so it's not tracked by default.
+      const gitignorePath = join(cwd, '.gitignore')
+      const entry = '.codehamr'
+      if (existsSync(gitignorePath)) {
+        const content = readFileSync(gitignorePath, 'utf8')
+        if (!content.split('\n').includes(entry)) {
+          const needsNewline = content.length > 0 && !content.endsWith('\n')
+          appendFileSync(gitignorePath, (needsNewline ? '\n' : '') + entry + '\n', 'utf8')
+        }
+      } else {
+        writeFileSync(gitignorePath, entry + '\n', 'utf8')
+      }
+
       // Commit an empty tree so there's a valid HEAD; harmless if there's
       // nothing staged yet. --allow-empty keeps it from failing on a fresh dir.
       await execFileP(
@@ -1481,13 +1496,46 @@ function wireIpc(): void {
  */
 function wireAutoUpdate(): void {
   if (!app.isPackaged) return
+
+  // electron-updater has no logging by default, so a failed update leaves
+  // zero trace anywhere the running app's console.error goes nowhere once
+  // packaged. Write to a plain file so a bad update is diagnosable after
+  // the fact instead of only visible as "the button did nothing."
+  const logPath = join(app.getPath('userData'), 'updater.log')
+  const logLine = (level: string, msg: string): void => {
+    try {
+      appendFileSync(logPath, `${new Date().toISOString()} [${level}] ${msg}\n`)
+    } catch {
+      // logging must never block the update flow
+    }
+  }
+  autoUpdater.logger = {
+    info: (msg) => logLine('info', String(msg)),
+    warn: (msg) => logLine('warn', String(msg)),
+    error: (msg) => logLine('error', String(msg)),
+    debug: (msg) => logLine('debug', String(msg)),
+  }
+
   autoUpdater.autoDownload = true
+
+  // Once true, an update has been downloaded and is waiting on the user to
+  // click "restart." `AppUpdater.currentVersion` is captured once at process
+  // start and never advances, so a same-version re-check would still see the
+  // downloaded release as "newer" and start a second download — which tears
+  // down and replaces the in-flight/staged handoff to Squirrel (macOS) mid-
+  // flight, silently corrupting the pending install. The button then quits
+  // the app but there's nothing valid left to install. Stop checking once we
+  // have a pending update; the next check happens fresh after restart.
+  let updatePending = false
+
   autoUpdater.on('update-downloaded', (info) => {
+    updatePending = true
     win?.webContents.send('app:update-ready', info.version)
   })
   autoUpdater.on('error', (err) => {
     // Non-fatal by definition: the running app is fine, only the check failed.
-    console.error('[updater]', err.message)
+    logLine('error', err.stack ?? err.message)
+    win?.webContents.send('app:update-error', err.message)
   })
   ipcMain.handle('app:install-update', async () => {
     for (const cwd of [...sessions.keys()]) stopSession(cwd)
@@ -1497,7 +1545,7 @@ function wireAutoUpdate(): void {
 
   // Periodically check for updates every 6 hours
   setInterval(() => {
-    void autoUpdater.checkForUpdates()
+    if (!updatePending) void autoUpdater.checkForUpdates()
   }, 6 * 60 * 60 * 1000)
 }
 

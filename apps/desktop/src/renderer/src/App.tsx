@@ -21,6 +21,7 @@ export default function App(): React.JSX.Element {
   const [tabs, setTabs] = useState<string[]>([])
   const [active, setActive] = useState<string | null>(null)
   const [updateVersion, setUpdateVersion] = useState<string | null>(null)
+  const [updateError, setUpdateError] = useState<string | null>(null)
 
   useEffect(() => {
     // Load appearance from main process on startup. This is the durable
@@ -37,6 +38,7 @@ export default function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => window.codehamr.onUpdateReady(setUpdateVersion), [])
+  useEffect(() => window.codehamr.onUpdateError(setUpdateError), [])
 
   const openWorkspace = async (): Promise<void> => {
     const dir = await window.codehamr.pickWorkspace()
@@ -112,11 +114,22 @@ export default function App(): React.JSX.Element {
         >
           +
         </button>
+        {updateError && (
+          <span
+            className="ml-auto text-xs text-red-400"
+            title={updateError}
+          >
+            update failed — {updateError}
+          </span>
+        )}
         {updateVersion && (
           <button
-            onClick={() => void window.codehamr.installUpdate()}
+            onClick={() => {
+              setUpdateError(null)
+              void window.codehamr.installUpdate()
+            }}
             title="an update downloaded in the background; restarting applies it (stops running agents)"
-            className="ml-auto rounded bg-sky-800 px-2.5 py-1 text-xs font-medium text-sky-100 hover:bg-sky-700"
+            className={`rounded bg-sky-800 px-2.5 py-1 text-xs font-medium text-sky-100 hover:bg-sky-700 ${updateError ? '' : 'ml-auto'}`}
           >
             Update to v{updateVersion} — restart
           </button>

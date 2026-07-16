@@ -192,6 +192,11 @@ const api = {
     ipcRenderer.on('app:update-ready', handler)
     return () => ipcRenderer.removeListener('app:update-ready', handler)
   },
+  onUpdateError: (cb: (message: string) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, message: string): void => cb(message)
+    ipcRenderer.on('app:update-error', handler)
+    return () => ipcRenderer.removeListener('app:update-error', handler)
+  },
   installUpdate: (): Promise<void> => ipcRenderer.invoke('app:install-update'),
   onExit: (
     cb: (info: { cwd: string; code: number | null; signal: string | null }) => void,
