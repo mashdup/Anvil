@@ -42,9 +42,9 @@
   background: transparent;
 }
 
-/* Shared prose styling for rendered Markdown files and mammoth's docx HTML in
-   the preview pane. Kept out of Tailwind arbitrary variants because the HTML
-   comes from mammoth (we don't control its class names). */
+/* Shared prose styling for rendered Markdown files in the preview pane. Kept
+   out of Tailwind arbitrary variants because the HTML comes from a Markdown
+   renderer (we don't control its class names). */
 .markdown {
   line-height: 1.6;
 }

@@ -1945,6 +1945,14 @@ function wireAutoUpdate(): void {
 
   autoUpdater.autoDownload = true
 
+  // A published feed should only ever advance the version, but a mis-sequenced
+  // release (e.g. a newer tag left as a GitHub *draft* so the feed still points
+  // at an older published one) would otherwise present the older build as an
+  // update. Squirrel then refuses the downgrade on restart and the install
+  // silently no-ops — the app quits but nothing changes. Refuse downgrades
+  // outright so a bad feed can never surface a phantom "restart to update".
+  autoUpdater.allowDowngrade = false
+
   // Once true, an update has been downloaded and is waiting on the user to
   // click "restart." `AppUpdater.currentVersion` is captured once at process
   // start and never advances, so a same-version re-check would still see the

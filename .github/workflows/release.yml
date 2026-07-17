@@ -5,7 +5,7 @@ name: Release
 #
 # Design: the platform jobs BUILD ONLY (`electron-builder --publish never`)
 # and upload their outputs as workflow artifacts. A single `release` job then
-# creates ONE draft release and attaches everything.
+# creates ONE published release and attaches everything.
 #
 # Why not let each platform publish itself: electron-builder's github publisher
 # finds-or-creates a draft by tag, but a draft's tag isn't a real git ref, so a
@@ -134,8 +134,8 @@ jobs:
             apps/desktop/release/latest-linux.yml
           if-no-files-found: error
 
-  # Single publisher: collect every platform's artifacts and create ONE draft
-  # release. Runs after the required builds; linux is continue-on-error, so a
+  # Single publisher: collect every platform's artifacts and create ONE
+  # published release. Runs after the required builds; linux is continue-on-error, so a
   # linux failure won't block publishing windows+macos.
   release:
     runs-on: ubuntu-latest
@@ -146,9 +146,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true # flatten dist-windows/ + dist-macos/ into dist/
-      - name: publish single draft release
+      - name: publish single release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          # Publish immediately (not a draft): electron-updater's GitHub feed
+          # only serves PUBLISHED releases, so a draft leaves every user's
+          # `releases/latest` pointing at the previous version — which then
+          # looks like a downgrade and Squirrel silently refuses to install
+          # (the "restart quits but nothing updates" bug). Keep this false.
+          draft: false
           files: dist/*
           fail_on_unmatched_files: true

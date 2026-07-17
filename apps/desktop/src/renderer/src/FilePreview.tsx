@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import * as pdfjsLib from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import mammoth from 'mammoth'
+import { renderAsync } from 'docx-preview'
 import { EXT_LANG, highlight } from './syntax'
 import { numberDiffLines, gut } from './workspace/diff'
 
@@ -686,38 +686,89 @@ function PdfView({ dataB64 }: { dataB64: string }): React.JSX.Element {
   )
 }
 
-/** Converts a .docx to HTML with mammoth and renders it. */
+/** Renders a .docx with docx-preview (page-level fidelity: styles, tables,
+ *  images, headers/footers, track-changes), then scales the fixed-pixel pages
+ *  to fit the pane width — like PdfView's canvases do via max-w-full. A
+ *  ResizeObserver recomputes the scale when the pane resizes. */
 function DocxView({ dataB64 }: { dataB64: string }): React.JSX.Element {
-  const [html, setHtml] = useState<string | null>(null)
-  const [error, setError] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+  const [status, setStatus] = useState<'loading' | 'done' | string>('loading')
+
+  // Scale the wrapper so its natural page width fits the pane. transform:
+  // scale() doesn't affect layout box, so the outer container height must be
+  // set to the scaled height to avoid a giant blank gap below.
+  const applyFit = useCallback(() => {
+    const outer = ref.current
+    const wrapper = outer?.querySelector<HTMLElement>('.docx-wrapper')
+    if (!outer || !wrapper) return
+    const avail = outer.clientWidth - 32 // match the p-4 padding
+    if (avail <= 0) return
+    const natWidth = wrapper.scrollWidth
+    if (natWidth <= 0) return
+    const scale = Math.min(1, avail / natWidth)
+    wrapper.style.transformOrigin = 'top center'
+    wrapper.style.transform = scale < 1 ? `scale(${scale})` : ''
+    // Compensate the layout height: scaled height - natural height (the gap
+    // transform leaves behind).
+    const natHeight = wrapper.scrollHeight
+    outer.style.height = scale < 1 ? `${natHeight * scale + 16}px` : ''
+  }, [])
 
   useEffect(() => {
     let cancelled = false
+    const container = ref.current
+    if (!container) return
+    container.innerHTML = ''
     void (async () => {
       try {
         const bytes = b64ToBytes(dataB64)
-        const { value } = await mammoth.convertToHtml({
-          arrayBuffer: bytes.buffer as ArrayBuffer,
+        await renderAsync(bytes.buffer as ArrayBuffer, container, undefined, {
+          className: 'docx-preview',
+          inWrapper: true,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+          renderChanges: true,
+          renderComments: true,
         })
-        if (!cancelled) setHtml(value)
+        if (!cancelled) {
+          setStatus('done')
+          applyFit()
+        }
       } catch (e) {
-        if (!cancelled) setError((e as Error).message || 'could not read document')
+        if (!cancelled) setStatus((e as Error).message || 'could not read document')
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [dataB64])
+  }, [dataB64, applyFit])
 
-  if (error) return <p className="p-6 text-center text-sm text-red-400">{error}</p>
-  if (html === null) return <p className="p-6 text-center text-sm text-zinc-500">reading document…</p>
-  // mammoth emits a bounded element set and no scripts; innerHTML never runs
-  // scripts, and the CSP blocks external loads. Embedded images arrive as
+  // Re-fit on pane resize.
+  useEffect(() => {
+    const outer = ref.current
+    if (!outer) return
+    const ro = new ResizeObserver(() => applyFit())
+    ro.observe(outer)
+    return () => ro.disconnect()
+  }, [applyFit])
+
+  if (status !== 'loading' && status !== 'done')
+    return <p className="p-6 text-center text-sm text-red-400">{status}</p>
+  // docx-preview renders only styled DOM (no scripts); innerHTML never runs
+  // scripts and the CSP blocks external loads. Embedded images arrive as
   // data: URLs (img-src data: is allowed).
   return (
-    <div
-      className="markdown mx-auto max-w-3xl px-6 py-5 text-sm text-zinc-200"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
+    <div className="bg-zinc-950/40 p-4">
+      {status === 'loading' && (
+        <p className="text-center text-sm text-zinc-500">rendering document…</p>
+      )}
+      <div
+        ref={ref}
+        className="mx-auto max-w-3xl [&_.docx-wrapper]:bg-white [&_.docx-wrapper]:shadow-lg"
+      />
+    </div>
   )
 }
