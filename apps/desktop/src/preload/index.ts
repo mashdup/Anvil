@@ -182,6 +182,16 @@ const api = {
     ipcRenderer.invoke('chats:delete', cwd, id),
   writeTranscript: (cwd: string, items: unknown): Promise<void> =>
     ipcRenderer.invoke('transcript:write', cwd, items),
+  /** Persisted context stat of the last turn, so the ContextMeter can describe
+   *  a restored chat's context usage on reload. */
+  readContextStat: (
+    cwd: string,
+  ): Promise<{ promptTokens: number; contextWindow?: number } | null> =>
+    ipcRenderer.invoke('context:read', cwd),
+  writeContextStat: (
+    cwd: string,
+    stat: { promptTokens: number; contextWindow?: number },
+  ): Promise<void> => ipcRenderer.invoke('context:write', cwd, stat),
   /** Project memory (out-of-repo, per-project): view, edit, download, load. */
   readMemory: (cwd: string): Promise<{ content: string; path: string }> =>
     ipcRenderer.invoke('memory:read', cwd),

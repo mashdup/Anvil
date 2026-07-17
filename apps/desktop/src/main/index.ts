@@ -1126,7 +1126,7 @@ async function removeSubscriptionProfile(cwd: string, provider: ProviderId): Pro
 // no knowledge of any of this.
 // ---------------------------------------------------------------------------
 
-const LIVE_CHAT_FILES = ['session.json', 'transcript.json']
+const LIVE_CHAT_FILES = ['session.json', 'transcript.json', 'context.json']
 
 const chatsDir = (cwd: string): string => join(cwd, '.codehamr', 'chats')
 const chatMetaPath = (cwd: string): string => join(chatsDir(cwd), 'meta.json')
@@ -1435,6 +1435,24 @@ function wireIpc(): void {
     const dir = join(cwd, '.codehamr')
     mkdirSync(dir, { recursive: true })
     await writeFile(join(dir, 'transcript.json'), JSON.stringify(items), 'utf8')
+  })
+
+  // Context stat of the last completed turn (prompt tokens vs the effective
+  // window), persisted beside the transcript so the ContextMeter can describe
+  // a restored chat's context usage on reload instead of blanking until the
+  // next turn. Small and opaque to main — the renderer owns the shape.
+  ipcMain.handle('context:read', async (_evt, cwd: string) => {
+    try {
+      return JSON.parse(await readFile(join(cwd, '.codehamr', 'context.json'), 'utf8'))
+    } catch {
+      return null
+    }
+  })
+
+  ipcMain.handle('context:write', async (_evt, cwd: string, stat: unknown) => {
+    const dir = join(cwd, '.codehamr')
+    mkdirSync(dir, { recursive: true })
+    await writeFile(join(dir, 'context.json'), JSON.stringify(stat), 'utf8')
   })
 
   // -------------------------------------------------------------------------

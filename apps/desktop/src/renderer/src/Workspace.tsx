@@ -257,6 +257,8 @@ export default function Workspace({
     reseatIds,
     push,
     uid,
+    lastInference,
+    setLastInference,
   })
 
   // Token/context readouts describe the *active* session's last turn, so they
@@ -293,6 +295,7 @@ export default function Workspace({
     setConnected,
     setQueue,
     resetSessionStats,
+    setLastInference,
     connected,
     busy,
     loadedRef,

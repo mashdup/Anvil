@@ -1,5 +1,5 @@
 import { useState, MutableRefObject } from 'react'
-import type { Item, ChatEntry, Attachment } from './types'
+import type { Item, ChatEntry, Attachment, InferenceStats } from './types'
 import { reseatIds } from './types'
 
 interface UseChatHistoryParams {
@@ -9,6 +9,8 @@ interface UseChatHistoryParams {
   setConnected: React.Dispatch<React.SetStateAction<boolean>>
   setQueue: React.Dispatch<React.SetStateAction<{ text: string; images: Attachment[] }[]>>
   resetSessionStats: () => void
+  /** Re-seed the context meter from the switched-in chat's persisted stat. */
+  setLastInference: (v: InferenceStats | null) => void
   connected: boolean
   busy: boolean
   loadedRef: MutableRefObject<boolean>
@@ -21,6 +23,7 @@ export function useChatHistory({
   setConnected,
   setQueue,
   resetSessionStats,
+  setLastInference,
   connected,
   busy,
   loadedRef,
@@ -47,6 +50,19 @@ export function useChatHistory({
     }
   }
 
+  /** Re-seed the context meter from the live chat's persisted context.json.
+   *  Called after a switch/new swaps the live pair on disk. */
+  const restoreContextStat = async (): Promise<void> => {
+    const stat = await window.codehamr.readContextStat(cwd)
+    if (stat && stat.promptTokens > 0) {
+      setLastInference({
+        promptTokens: stat.promptTokens,
+        completionTokens: 0,
+        contextWindow: stat.contextWindow,
+      })
+    }
+  }
+
   const newChat = async (): Promise<void> => {
     if (!connected || busy) return
     setHistoryOpen(false)
@@ -55,7 +71,7 @@ export function useChatHistory({
     await window.codehamr.newChatSession(cwd) // archives the current pair
     setItems([])
     setQueue([])
-    resetSessionStats()
+    resetSessionStats() // fresh chat: no context.json yet, meter starts empty
     await window.codehamr.startAgent(cwd)
   }
 
@@ -68,6 +84,9 @@ export function useChatHistory({
     await loadTranscriptFromDisk()
     setQueue([])
     resetSessionStats()
+    // switchChat swapped context.json to the target chat's; re-seed the meter
+    // from it (after reset, so this value is what sticks and re-persists).
+    await restoreContextStat()
     await window.codehamr.startAgent(cwd)
   }
 
