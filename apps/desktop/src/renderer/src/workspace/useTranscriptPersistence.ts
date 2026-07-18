@@ -14,6 +14,8 @@ interface UseTranscriptPersistenceParams {
    *  a restored chat's context usage on reload. */
   lastInference: InferenceStats | null
   setLastInference: (v: InferenceStats | null) => void
+  /** Transient banner shown above the composer (not added to transcript). */
+  showToast: (msg: string) => void
 }
 
 export function useTranscriptPersistence({
@@ -27,6 +29,7 @@ export function useTranscriptPersistence({
   uid,
   lastInference,
   setLastInference,
+  showToast,
 }: UseTranscriptPersistenceParams): React.MutableRefObject<boolean> {
   const loadedRef = useRef(false)
   const bootedRef = useRef(false)
@@ -67,15 +70,10 @@ export function useTranscriptPersistence({
       loadedRef.current = true
       const { seededFrom } = await window.codehamr.startAgent(cwd)
       if (seededFrom) {
-        push({
-          kind: 'notice',
-          id: uid(),
-          text: `new project — endpoints configured from your "${seededFrom}" preset`,
-          tone: 'info',
-        })
+        showToast(`new project — endpoints configured from your "${seededFrom}" preset`)
       }
     })()
-  }, [cwd, push])
+  }, [cwd, push, showToast])
 
   // Debounced transcript autosave; gated on loadedRef so the initial empty
   // state can never clobber a saved transcript before the restore completes.

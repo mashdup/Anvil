@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dialog Test Page</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #fafafa; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  button { display: block; width: 100%; padding: 10px; margin: 8px 0; font-size: 14px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
+  button:hover { background: #e8e8e8; }
+  #log { margin-top: 20px; padding: 12px; background: #1a1a1a; color: #0f0; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; min-height: 60px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Dialog Bridge Test</h1>
+<button onclick="fireAlert()">alert("Hello from webview!")</button>
+<button onclick="fireConfirm()">confirm("Proceed?")</button>
+<button onclick="firePrompt()">prompt("What's your name?", "World")</button>
+<button onclick="fireChained()">Chained: alert → confirm → prompt</button>
+<div id="log">[log] waiting…</div>
+<script>
+  const log = (s) => {
+    const el = document.getElementById('log')
+    el.textContent += '\n' + s
+    console.log('[page]', s)
+  }
+  function fireAlert() {
+    log('alert() returned (void)')
+    alert('Hello from webview!\n\nThis should show in the in-app modal.')
+  }
+  function fireConfirm() {
+    const r = confirm('Do you want to proceed?\n\nOK=true, Cancel=false')
+    log('confirm() returned: ' + r)
+  }
+  function firePrompt() {
+    const r = prompt('What is your name?', 'World')
+    log('prompt() returned: ' + JSON.stringify(r))
+  }
+  function fireChained() {
+    alert('Step 1: alert')
+    if (confirm('Step 2: confirm — continue?')) {
+      const name = prompt('Step 3: prompt — name?', 'friend')
+      log('chain result: name=' + JSON.stringify(name))
+    } else {
+      log('chain: cancelled at confirm')
+    }
+  }
+</script>
+</body>
+</html>

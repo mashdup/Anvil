@@ -31,6 +31,9 @@ const CAP = 2000
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p
 
+// HTML files can be opened in the live browser preview pane.
+const isHtml = (p: string): boolean => /\.x?html?$/i.test(p)
+
 // The OS file-manager name, so menu labels read naturally per platform.
 const revealLabel =
   window.codehamr.platform === 'darwin'
@@ -51,6 +54,7 @@ export function FileTree({
   changed,
   reload,
   onOpen,
+  onOpenInBrowser,
   onToast,
 }: {
   root: string
@@ -58,6 +62,7 @@ export function FileTree({
   changed: ChangedPaths
   reload: { dirs: string[]; nonce: number } | null
   onOpen: (path: string) => void
+  onOpenInBrowser?: (path: string) => void
   onToast?: (msg: string) => void
 }): React.JSX.Element {
   const [dir, setDir] = useState(root)
@@ -354,6 +359,16 @@ export function FileTree({
               label="Open in preview"
               onClick={() => {
                 onOpen(menu.entry.path)
+                setMenu(null)
+              }}
+            />
+          )}
+          {!menu.entry.isDir && isHtml(menu.entry.path) && onOpenInBrowser && (
+            <MenuItem
+              icon="◧"
+              label="Open in browser"
+              onClick={() => {
+                onOpenInBrowser(menu.entry.path)
                 setMenu(null)
               }}
             />

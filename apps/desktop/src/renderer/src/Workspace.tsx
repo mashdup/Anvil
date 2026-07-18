@@ -113,11 +113,24 @@ export default function Workspace({
     adjustSplit,
     browserNav,
     requestAgentPreview,
+    openBrowserAt,
     previewInUse,
     mainRef,
     layout,
     openFile,
   } = usePreviewPanels(cwd, toAbs)
+
+  // Open an HTML file in the live browser pane (new tab if none loaded). Builds
+  // a file:// URL from the absolute path — encodeURI keeps spaces/# etc. valid,
+  // and Windows backslashes/drive paths are normalized to forward slashes.
+  const openHtmlInBrowser = useCallback(
+    (path: string): void => {
+      const abs = toAbs(path).replace(/\\/g, '/')
+      const url = encodeURI(`file://${abs.startsWith('/') ? '' : '/'}${abs}`)
+      openBrowserAt(url)
+    },
+    [toAbs, openBrowserAt],
+  )
   const [items, setItems] = useState<Item[]>([])
 
   // Git branch + working-tree diff stat for the bar, refreshed on mount, on
@@ -260,6 +273,7 @@ export default function Workspace({
     uid,
     lastInference,
     setLastInference,
+    showToast,
   })
 
   // Token/context readouts describe the *active* session's last turn, so they
@@ -547,6 +561,7 @@ export default function Workspace({
                       workspaceRoot={cwd}
                       onClose={closeViewer}
                       onUseInPrompt={useSnippetInPrompt}
+                      onOpenInBrowser={openHtmlInBrowser}
                     />
                   )
                 : browserOpen && (
@@ -888,6 +903,7 @@ export default function Workspace({
                 changed={changedPaths}
                 reload={treeReload}
                 onOpen={openFile}
+                onOpenInBrowser={openHtmlInBrowser}
                 onToast={showToast}
               />
             </aside>
@@ -920,6 +936,7 @@ export default function Workspace({
                   changed={changedPaths}
                   reload={treeReload}
                   onOpen={openFile}
+                  onOpenInBrowser={openHtmlInBrowser}
                   onToast={showToast}
                 />
               </div>

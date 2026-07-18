@@ -19,6 +19,9 @@ export type Preview =
 
 const PDF_PAGE_CAP = 50
 
+// HTML files can be opened in the live browser preview pane.
+const isHtml = (p: string): boolean => /\.x?html?$/i.test(p)
+
 function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64)
   const bytes = new Uint8Array(bin.length)
@@ -31,11 +34,13 @@ export function FilePreview({
   workspaceRoot,
   onClose,
   onUseInPrompt,
+  onOpenInBrowser,
 }: {
   preview: Preview
   workspaceRoot: string
   onClose: () => void
   onUseInPrompt: (snippet: string) => void
+  onOpenInBrowser?: (path: string) => void
 }): React.JSX.Element {
   // Word wrap for code previews: on by default, persisted app-wide.
   const [wrap, setWrap] = useState(() => localStorage.getItem('chwrap') !== '0')
@@ -208,10 +213,32 @@ export function FilePreview({
             {mdRaw ? 'Preview' : 'Raw'}
           </button>
         )}
+        {isHtml(preview.path) && onOpenInBrowser && (
+          <button
+            onClick={() => onOpenInBrowser(preview.path)}
+            title="open this HTML file in the browser preview"
+            className={`shrink-0 rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 ${
+              preview.kind === 'text' || preview.kind === 'markdown' || hasDiff ? '' : 'ml-auto'
+            }`}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              className="h-3.5 w-3.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="9" />
+              <path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" />
+            </svg>
+          </button>
+        )}
         <button
           onClick={onClose}
           className={`shrink-0 rounded px-1.5 text-zinc-400 hover:bg-zinc-800 ${
-            preview.kind === 'text' || preview.kind === 'markdown' || hasDiff ? '' : 'ml-auto'
+            (preview.kind === 'text' || preview.kind === 'markdown' || hasDiff) || (isHtml(preview.path) && onOpenInBrowser) ? '' : 'ml-auto'
           }`}
         >
           ✕

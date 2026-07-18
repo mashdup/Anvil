@@ -63,6 +63,17 @@ export function usePreviewPanels(cwd: string, toAbs: (p: string) => string) {
   const requestAgentPreview = useCallback((path: string | undefined, url: string | undefined) => {
     setAgentPreview((prev) => ({ path, url, nonce: (prev?.nonce ?? 0) + 1 }))
   }, [])
+  // Open the live browser pane at a URL (new tab if none loaded), used by the
+  // "Open in browser" affordances for HTML files. Same plumbing as the agent's
+  // preview_url path: bump browserNav's nonce, reveal + stack the browser panel.
+  const openBrowserAt = useCallback(
+    (url: string) => {
+      setBrowserNav((prev) => ({ url, nonce: (prev?.nonce ?? 0) + 1 }))
+      setBrowserOpen(true)
+      openPanel('browser')
+    },
+    [openPanel],
+  )
   const previewInUse = panelOrder.length > 0
   const [mainRef, mainW] = useElementWidth<HTMLDivElement>()
   // Default to a wide value until measured so the first paint is inline (the
@@ -161,6 +172,7 @@ export function usePreviewPanels(cwd: string, toAbs: (p: string) => string) {
     adjustSplit,
     browserNav,
     requestAgentPreview,
+    openBrowserAt,
     previewInUse,
     mainRef,
     mainW,
