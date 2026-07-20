@@ -41,7 +41,7 @@ export function ResizeHandle({ onResize }: { onResize: (dx: number) => void }): 
   return (
     <div
       onMouseDown={onMouseDown}
-      className="w-1 shrink-0 cursor-col-resize bg-zinc-800 transition-colors hover:bg-sky-600"
+      className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-sky-600/60"
     />
   )
 }
@@ -71,7 +71,7 @@ export function RowResizeHandle({ onResize }: { onResize: (dy: number) => void }
   return (
     <div
       onMouseDown={onMouseDown}
-      className="h-1 shrink-0 cursor-row-resize bg-zinc-800 transition-colors hover:bg-sky-600"
+      className="h-1 shrink-0 cursor-row-resize bg-transparent transition-colors hover:bg-sky-600/60"
     />
   )
 }

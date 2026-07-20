@@ -578,7 +578,7 @@ export default function Workspace({
 
   return (
     <div
-      className={`${visible ? 'flex' : 'hidden'} relative min-h-0 flex-1 flex-col`}
+      className={`${visible ? 'flex' : 'hidden'} relative min-h-0 flex-1 flex-col gap-2 p-2`}
       onDragEnter={(e) => {
         if (!e.dataTransfer.types.includes('Files')) return
         dragDepth.current += 1
@@ -608,7 +608,7 @@ export default function Workspace({
         </div>
       )}
 
-      <div ref={barRef} className="relative flex items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
+      <div ref={barRef} className="relative flex items-center gap-2 rounded-xl border border-zinc-800/80 bg-zinc-950 px-3 py-1.5 shadow-lg">
         {compactBar ? (
           <div className="relative">
             <button
@@ -890,12 +890,12 @@ export default function Workspace({
         />
       )}
 
-      <div ref={mainRef} className="relative flex min-h-0 flex-1">
+      <div ref={mainRef} className="relative flex min-h-0 flex-1 gap-1">
         {layout.tree.mode === 'inline' && (
           <>
             <aside
               style={{ width: layout.tree.width }}
-              className="shrink-0 overflow-hidden border-r border-zinc-800"
+              className="shrink-0 overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-950 shadow-lg"
             >
               <FileTree
                 root={cwd}
@@ -918,7 +918,7 @@ export default function Workspace({
             preview's z-40), honoring the view hierarchy. */}
         {layout.tree.mode === 'overlay' && (
           <div className="absolute inset-0 z-30 flex">
-            <aside className="relative flex w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl">
+            <aside className="relative flex w-full flex-col overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-950 shadow-2xl">
               <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 px-3 py-1.5">
                 <span className="text-xs font-medium text-zinc-400">Files</span>
                 <button
@@ -944,7 +944,7 @@ export default function Workspace({
           </div>
         )}
 
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-950 shadow-lg">
           <div className="relative flex-1 min-h-0">
           <div
             ref={scrollRef}
@@ -1025,7 +1025,7 @@ export default function Workspace({
             />
           )}
 
-          <footer className="border-t border-zinc-800 p-3">
+          <footer className="p-3">
             {ask && (
               <div className="mb-2 rounded-lg border border-sky-800/60 bg-sky-950/30 p-3">
                 <div className="mb-2 text-sm text-zinc-200">{ask.prompt}</div>
@@ -1336,7 +1336,7 @@ export default function Workspace({
             <div
               ref={previewSlotRef}
               style={{ width: layout.preview.width }}
-              className="flex shrink-0 flex-col overflow-hidden"
+              className="flex shrink-0 flex-col overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-950 shadow-lg"
             >
               {previewStack}
             </div>
@@ -1350,7 +1350,7 @@ export default function Workspace({
           <div className="absolute inset-0 z-40 flex">
             <div
               ref={previewSlotRef}
-              className="relative flex w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl"
+              className="relative flex w-full flex-col overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-950 shadow-2xl"
             >
               {previewStack}
             </div>

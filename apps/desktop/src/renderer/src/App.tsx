@@ -96,7 +96,7 @@ export default function App(): React.JSX.Element {
   const isWin = window.codehamr.platform === 'win32'
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-screen flex-col bg-zinc-900">
       <header
         className={`titlebar flex h-10 shrink-0 items-center gap-1 border-b border-zinc-800 px-2 ${
           isMac ? 'pl-20' : '' // clear the traffic lights

@@ -295,7 +295,7 @@ export function BrowserPane({
   }
 
   return (
-    <div className="flex h-full w-full flex-col border-l border-zinc-800">
+    <div className="flex h-full w-full flex-col">
       {tabs.length > 1 && (
         <div className="flex h-8 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-zinc-800 bg-zinc-950 px-1.5">
           {tabs.map((tab) => (
